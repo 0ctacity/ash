@@ -2,6 +2,30 @@
 
 ASH lets coding agents operate on other machines over SSH. It is a local Go binary with a CLI and MCP tools for execution, SFTP file access, and persistent shells. No remote ASH daemon is required.
 
+## Install
+
+On Linux AMD64/ARM64 or macOS Apple Silicon, install the latest stable GitHub release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0ctacity/ash/main/install.sh | sh
+```
+
+The installer verifies the archive against the release's SHA256SUMS.txt and installs
+`ash` to `~/.local/bin` without sudo. Add that directory to your `PATH` if needed.
+It requires `curl`, `tar`, and either `sha256sum` or `shasum`; Go is not required.
+Run the same command again to update. To select a release or installation directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/0ctacity/ash/main/install.sh | ASH_VERSION=v0.1.0 ASH_INSTALL_DIR="$HOME/bin" sh
+```
+
+These URLs work after the installer is pushed to `main` and a matching release is
+published. Windows users can extract `ash.exe` from the Windows archive on
+[GitHub Releases](https://github.com/0ctacity/ash/releases).
+
+Installation only places the executable on your machine. Configure a host and
+register the MCP server with your client using the sections below.
+
 ## Build
 
 Requires Go 1.26.5 or newer.
