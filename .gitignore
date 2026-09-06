@@ -1,0 +1,5 @@
+/ash
+/bin/
+/.deps/
+/dist/
+__pycache__/
