@@ -1,0 +1,2 @@
+# Go formatting and shell scripts require LF, including Windows checkouts.
+* text=auto eol=lf
