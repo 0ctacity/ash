@@ -76,13 +76,25 @@ func (p Policy) CheckShell() error {
 
 // CheckExecutable verifies an argv program against allowed_commands. A shell
 // allowlist cannot be enforced, so this applies to argv mode only.
+//
+// An entry containing "/" is an exact-path allowlist: the program must equal
+// it after normalization, so allowing /usr/bin/git does not accept /tmp/git.
+// A bare entry such as "git" is deliberately basename semantics: it matches
+// the program name wherever it resides, because resolving which PATH entry
+// would run is a property of the remote login shell, not of ASH.
 func (p Policy) CheckExecutable(program string) error {
 	if len(p.AllowedCommands) == 0 {
 		return nil
 	}
 	base := path.Base(program)
 	for _, allowed := range p.AllowedCommands {
-		if program == allowed || path.Base(allowed) == base {
+		if strings.ContainsRune(allowed, '/') {
+			if program == path.Clean(allowed) {
+				return nil
+			}
+			continue
+		}
+		if base == allowed {
 			return nil
 		}
 	}
@@ -189,6 +201,11 @@ func validateRoot(root string) error {
 func within(root, target string) bool {
 	root = path.Clean(root)
 	target = path.Clean(target)
+	if root == "/" {
+		// path.Clean leaves "/" as "/"; root+"/" would form "//" and reject
+		// every absolute path. The filesystem root contains everything.
+		return strings.HasPrefix(target, "/")
+	}
 	if root == target {
 		return true
 	}

@@ -94,6 +94,44 @@ func TestRootBoundaries(t *testing.T) {
 	}
 }
 
+func TestRootSlashAllowsEverythingUnderRoot(t *testing.T) {
+	p := Policy{ReadRoots: []string{"/"}, WriteRoots: []string{"/"}}
+	for _, path := range []string{"/", "/etc/passwd", "/data/inner/file"} {
+		if err := p.CheckRoots(path, false); err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if err := p.CheckRoots(path, true); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	if err := (Policy{CwdRoots: []string{"/"}}).CheckCwd("/etc"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckExecutablePathEntriesAreExact(t *testing.T) {
+	p := Policy{AllowedCommands: []string{"/usr/bin/git", "grep"}}
+	// Exact path matches are accepted.
+	if err := p.CheckExecutable("/usr/bin/git"); err != nil {
+		t.Fatal(err)
+	}
+	// A same-named binary elsewhere must NOT inherit the /usr/bin allowlist.
+	if err := p.CheckExecutable("/tmp/git"); err == nil {
+		t.Fatal("/tmp/git accepted via /usr/bin/git basename match")
+	}
+	// A bare entry matches the basename wherever it resides.
+	if err := p.CheckExecutable("/usr/bin/grep"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CheckExecutable("/opt/bin/grep"); err != nil {
+		t.Fatal(err)
+	}
+	// Unrelated programs are still rejected.
+	if err := p.CheckExecutable("/usr/bin/curl"); err == nil {
+		t.Fatal("curl accepted")
+	}
+}
+
 func TestBounds(t *testing.T) {
 	p := Policy{MaxTimeoutSeconds: 45, MaxInputBytes: 10, MaxOutputBytes: 20}
 	if p.MaxTimeout() != 45*time.Second {
