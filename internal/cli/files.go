@@ -8,10 +8,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 
 	"ash/internal/service"
 	"ash/internal/transport"
@@ -136,24 +134,21 @@ func ensureNotSymlink(path string) error {
 }
 
 // openNewFile opens target for writing without following a symlink placed at
-// the path (before or during the open). O_NOFOLLOW makes the kernel refuse
-// symlink finals atomically where available; the Windows branch relies on the
-// earlier Lstat walk plus os.OpenFile not creating symlink entries itself.
+// the path (before or during the open). On POSIX, O_NOFOLLOW makes the kernel
+// refuse symlink finals atomically; Windows relies on the earlier Lstat walk
+// plus os.OpenFile not creating symlink entries itself.
 func openNewFile(target string) (*os.File, error) {
-	if runtime.GOOS != "windows" {
-		file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
-		if err != nil {
-			if errors.Is(err, syscall.ELOOP) {
-				return nil, fmt.Errorf("refusing to write through symlink %q", target)
-			}
-			return nil, err
-		}
-		return file, nil
-	}
 	if err := ensureNotSymlink(target); err != nil {
 		return nil, err
 	}
-	return os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	file, err := openNoFollow(target)
+	if err != nil {
+		if errors.Is(err, errSymlinkRefused) {
+			return nil, fmt.Errorf("refusing to write through symlink %q", target)
+		}
+		return nil, err
+	}
+	return file, nil
 }
 
 // runUpload maps a local directory onto a bounded remote tree, skipping symlinks.
