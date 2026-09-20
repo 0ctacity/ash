@@ -39,14 +39,15 @@ type resource interface {
 	close() error
 }
 
-// resourceLifecycle holds the per-dial auxiliary resources (context stop and
-// agent socket cleanup) that must live as long as the pooled connection.
+// resourceLifecycle holds the per-dial auxiliary resources (agent socket and
+// its context stop) that must live as long as the pooled connection.
 type resourceLifecycle struct {
 	stop    func() bool
 	cleanup func()
 }
 
-// lifecycleAware is implemented by resources carrying per-dial cleanup.
+// lifecycleAware is implemented by resources carrying per-dial cleanup. The
+// dialer attaches the lifecycle before the resource enters the pool.
 type lifecycleAware interface {
 	setLifecycle(resourceLifecycle)
 }
@@ -67,14 +68,6 @@ type resourcePool struct {
 	ttl     time.Duration
 	now     func() time.Time
 	closed  bool
-}
-
-// trackResources attaches per-dial cleanup to a pooled resource so it runs
-// exactly once when the connection is finally closed.
-func (p *resourcePool) trackResources(res resource, stop func() bool, cleanup func()) {
-	if aware, ok := res.(lifecycleAware); ok {
-		aware.setLifecycle(resourceLifecycle{stop: stop, cleanup: cleanup})
-	}
 }
 
 func newResourcePool(maxConnections, maxIdle int, ttl time.Duration, now func() time.Time) *resourcePool {

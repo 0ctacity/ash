@@ -25,18 +25,25 @@ import (
 type Transport struct {
 	knownHostsPath string
 	pool           *resourcePool
+	dial           func(context.Context, host.Host) (*sshResource, error)
 }
 
 func New(knownHostsPath string) (*Transport, error) {
-	return &Transport{
+	t := &Transport{
 		knownHostsPath: knownHostsPath,
 		pool:           newResourcePool(DefaultMaxConnections, DefaultMaxIdlePerHost, DefaultIdleLifetime, nil),
-	}, nil
+	}
+	t.setDial(t.dialSSH)
+	return t, nil
 }
 
 // Close shuts down the connection pool, closing every idle connection. Active
 // operations keep their own connection until they finish.
 func (t *Transport) Close() { t.pool.Close() }
+
+// setDial replaces the dial implementation. It exists for tests that must
+// observe which exact resource instance enters the pool.
+func (t *Transport) setDial(fn func(context.Context, host.Host) (*sshResource, error)) { t.dial = fn }
 
 // keyFor derives the reuse boundary for a host. Host, authentication material,
 // agent, host-key alias, and trust file must all match.
@@ -162,20 +169,19 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 	if err := t.pool.reserve(ctx); err != nil {
 		return nil, nil, operationError(ctx, err)
 	}
-	client, err := t.dial(ctx, h)
+	res, err := t.dial(ctx, h)
 	if err != nil {
 		t.pool.releaseSlot()
 		return nil, nil, err
 	}
-	res := &sshResource{client: client}
-	return client, func() { t.pool.put(key, res) }, nil
+	return res.client, func() { t.pool.put(key, res) }, nil
 }
 
-// dial establishes a fresh, verified connection. The returned cleanup closes
-// the connection and any agent socket it opened; it is only valid for
-// connections that fail before entering the pool. A pooled connection is never
-// closed by the caller; release returns it to the pool instead.
-func (t *Transport) dial(ctx context.Context, h host.Host) (*gossh.Client, error) {
+// dialSSH establishes a fresh, verified connection and returns the resource
+// that owns it, lifecycle included. The caller (connect) pools this exact
+// resource. Cleanup for a failed dial happens inside dialSSH; a returned
+// resource is only ever closed through the pool.
+func (t *Transport) dialSSH(ctx context.Context, h host.Host) (*sshResource, error) {
 	hostKey, err := t.knownHosts()
 	if err != nil {
 		return nil, err
@@ -248,11 +254,24 @@ func (t *Transport) dial(ctx context.Context, h host.Host) (*gossh.Client, error
 		cleanupAgent()
 		return nil, operationError(ctx, fmt.Errorf("connect to host %q: %w", h.Name, err))
 	}
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	cleanup := func() { stop(); conn.Close(); cleanupAgent() }
+	// The TCP connection outlives the operation context when pooled, so it
+	// must not be stopped by that context. HandshakeAbort cancels a handshake
+	// that would otherwise outstay the caller's deadline; it is consumed
+	// before the connection enters the pool.
+	handshakeDone := make(chan struct{})
+	stopHandshake := context.AfterFunc(ctx, func() {
+		select {
+		case <-handshakeDone:
+		default:
+			conn.Close()
+		}
+	})
+	cleanup := func() { conn.Close(); cleanupAgent() }
 	algorithms := preferredHostKeyAlgorithms(hostKey, verifyAddress, conn.RemoteAddr())
 	sshConn, chans, reqs, err := gossh.NewClientConn(conn, verifyAddress, &gossh.ClientConfig{User: h.User, Auth: []gossh.AuthMethod{gossh.PublicKeys(allSigners...)}, HostKeyCallback: hostKey, HostKeyAlgorithms: algorithms})
+	close(handshakeDone)
 	if err != nil {
+		stopHandshake()
 		cleanup()
 		err = operationError(ctx, err)
 		if strings.Contains(err.Error(), "unable to authenticate") {
@@ -260,13 +279,11 @@ func (t *Transport) dial(ctx context.Context, h host.Host) (*gossh.Client, error
 		}
 		return nil, err
 	}
+	stopHandshake()
 	client := gossh.NewClient(sshConn, chans, reqs)
-	// Once the handshake succeeds the per-dial resources belong to the
-	// long-lived connection: the context stop and agent socket must stay alive
-	// until the connection itself closes.
-	res := &sshResource{client: client}
-	t.pool.trackResources(res, stop, cleanup)
-	return client, nil
+	// The per-dial resources (agent socket) belong to the long-lived
+	// connection and are released exactly once when it is finally closed.
+	return &sshResource{client: client}, nil
 }
 
 // preferredHostKeyAlgorithms asks the known_hosts matcher for this host's keys

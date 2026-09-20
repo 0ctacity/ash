@@ -122,7 +122,7 @@ func TestPoolTrackResourcesRunsCleanupOnce(t *testing.T) {
 	key := connKey{address: "h1"}
 	cleanups := 0
 	res := &fakeResource{aliveVal: true}
-	p.trackResources(res, func() bool { return true }, func() { cleanups++ })
+	res.setLifecycle(resourceLifecycle{stop: func() bool { return true }, cleanup: func() { cleanups++ }})
 	p.reserve(t.Context())
 	p.put(key, res)
 	got, ok := p.get(key)
