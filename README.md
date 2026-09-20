@@ -91,7 +91,16 @@ Each command output stream is capped at 8 MiB and reports truncation. Reads and 
 
 ## Persistent shells
 
-Persistent shells use [Zellij’s headless CLI](https://zellij.dev/documentation/cli-recipes.html) and require Zellij 0.44 or newer installed on the remote host. They are separate from one-shot `exec`: shell variables, working directory, and running commands survive ASH process exits and SSH disconnects. ASH opens short SSH connections to control Zellij; it does not keep an SSH session alive.
+Persistent shells use a per-host backend. Zellij ([headless CLI](https://zellij.dev/documentation/cli-recipes.html), 0.44 or newer) is the default; tmux is selected with `shell_backend = "tmux"` and requires tmux on the remote host.
+
+```toml
+[hosts.fedora]
+address = "100.64.1.20"
+user = "ata"
+shell_backend = "tmux"
+```
+
+CLI and MCP behavior is backend-independent; backend-specific features are never exposed. Both backends map ASH-generated IDs to a reserved remote namespace (`ash-<id>`) and query the backend for liveness rather than trusting local metadata, so ASH lists and controls only its own sessions. tmux uses a dedicated server socket (`tmux -L ash`), keeping ASH sessions fully separate from the user's personal sessions. Shells are separate from one-shot `exec`: shell variables, working directory, and running commands survive ASH process exits and SSH disconnects. ASH opens short SSH connections to control the backend; it does not keep an SSH session alive.
 
 ```sh
 ./ash shell create fedora --cwd '~/projects'
@@ -163,7 +172,7 @@ go vet ./...
 
 The tests cover configuration, policy, shell escaping, output limits, CLI behavior and the official MCP client/server protocol. Run `ASH_INTEGRATION=1 go test -race ./integration` to exercise a real local OpenSSH daemon. See [integration](integration/README.md) for prerequisites. The daemon fixture is skipped unless explicitly enabled.
 
-Persistent-shell integration requires a trusted host with Zellij 0.44 or newer:
+Persistent-shell integration requires a trusted host with Zellij 0.44 or newer (the tmux backend is unit-tested against exact command construction; opt-in remote tmux tests can use the same environment):
 
 ```sh
 ASH_ZELLIJ_HOST=fedora ASH_ZELLIJ_CONFIG="$HOME/.config/ash/config.toml" \

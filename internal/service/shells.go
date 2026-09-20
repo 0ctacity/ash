@@ -14,15 +14,47 @@ import (
 	"ash/internal/transport"
 )
 
-// ShellService authorizes persistent-shell operations independently of one-shot exec.
-// It keeps no session state; the backend is the authority on remote liveness.
+// ShellService authorizes persistent-shell operations independently of one-shot
+// exec. It keeps no session state; the selected backend is the authority on
+// remote liveness. Backend selection is per host and never exposed as
+// backend-specific operations to CLI or MCP.
 type ShellService struct {
-	hosts   *host.Registry
-	backend shell.Backend
+	hosts          *host.Registry
+	backends       map[string]shell.Backend
+	defaultBackend string
 }
 
 func NewShells(hosts *host.Registry, backend shell.Backend) *ShellService {
-	return &ShellService{hosts: hosts, backend: backend}
+	return NewShellsWithBackends(hosts, backend)
+}
+
+// NewShellsWithBackends registers one or more shell backends. The first
+// non-nil backend is the default for hosts that do not name one.
+func NewShellsWithBackends(hosts *host.Registry, backends ...shell.Backend) *ShellService {
+	registry := make(map[string]shell.Backend, len(backends))
+	defaultBackend := ""
+	for _, backend := range backends {
+		if backend == nil {
+			continue
+		}
+		registry[backend.Name()] = backend
+		if defaultBackend == "" {
+			defaultBackend = backend.Name()
+		}
+	}
+	return &ShellService{hosts: hosts, backends: registry, defaultBackend: defaultBackend}
+}
+
+func (s *ShellService) backendFor(h host.Host) (shell.Backend, error) {
+	name := h.ShellBackend
+	if name == "" {
+		name = s.defaultBackend
+	}
+	backend, ok := s.backends[name]
+	if !ok {
+		return nil, fmt.Errorf("host %q: shell backend %q is not available", h.Name, name)
+	}
+	return backend, nil
 }
 
 func (s *ShellService) resolve(ctx context.Context, name string) (host.Host, error) {
@@ -39,12 +71,16 @@ func (s *ShellService) resolve(ctx context.Context, name string) (host.Host, err
 	return h, nil
 }
 
-func (s *ShellService) info(name, id string) shell.Info {
-	return shell.Info{ID: id, Host: name, Backend: s.backend.Name()}
+func (s *ShellService) info(backend shell.Backend, name, id string) shell.Info {
+	return shell.Info{ID: id, Host: name, Backend: backend.Name()}
 }
 
 func (s *ShellService) Create(ctx context.Context, name, cwd string) (shell.Info, error) {
 	h, err := s.resolve(ctx, name)
+	if err != nil {
+		return shell.Info{}, err
+	}
+	backend, err := s.backendFor(h)
 	if err != nil {
 		return shell.Info{}, err
 	}
@@ -58,10 +94,10 @@ func (s *ShellService) Create(ctx context.Context, name, cwd string) (shell.Info
 	id := "sh_" + hex.EncodeToString(random[:])
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	if err = s.backend.Create(ctx, h, id, cwd); err != nil {
+	if err = backend.Create(ctx, h, id, cwd); err != nil {
 		return shell.Info{}, operationError(ctx, name, "shell create", err)
 	}
-	return s.info(name, id), nil
+	return s.info(backend, name, id), nil
 }
 
 func (s *ShellService) List(ctx context.Context, name string) ([]shell.Info, error) {
@@ -69,22 +105,30 @@ func (s *ShellService) List(ctx context.Context, name string) ([]shell.Info, err
 	if err != nil {
 		return nil, err
 	}
+	backend, err := s.backendFor(h)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	ids, err := s.backend.List(ctx, h)
+	ids, err := backend.List(ctx, h)
 	if err != nil {
 		return nil, operationError(ctx, name, "shell list", err)
 	}
 	sort.Strings(ids)
 	out := make([]shell.Info, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, s.info(name, id))
+		out = append(out, s.info(backend, name, id))
 	}
 	return out, nil
 }
 
 func (s *ShellService) Send(ctx context.Context, name, id, input string) error {
 	h, err := s.resolve(ctx, name)
+	if err != nil {
+		return err
+	}
+	backend, err := s.backendFor(h)
 	if err != nil {
 		return err
 	}
@@ -99,11 +143,15 @@ func (s *ShellService) Send(ctx context.Context, name, id, input string) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	return operationError(ctx, name, "shell send", s.backend.Send(ctx, h, id, input))
+	return operationError(ctx, name, "shell send", backend.Send(ctx, h, id, input))
 }
 
 func (s *ShellService) Read(ctx context.Context, name, id string) (shell.Output, error) {
 	h, err := s.resolve(ctx, name)
+	if err != nil {
+		return shell.Output{}, err
+	}
+	backend, err := s.backendFor(h)
 	if err != nil {
 		return shell.Output{}, err
 	}
@@ -112,7 +160,7 @@ func (s *ShellService) Read(ctx context.Context, name, id string) (shell.Output,
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	output, err := s.backend.Read(ctx, h, id)
+	output, err := backend.Read(ctx, h, id)
 	return output, operationError(ctx, name, "shell read", err)
 }
 
@@ -121,10 +169,14 @@ func (s *ShellService) Close(ctx context.Context, name, id string) error {
 	if err != nil {
 		return err
 	}
+	backend, err := s.backendFor(h)
+	if err != nil {
+		return err
+	}
 	if err = shell.ValidateID(id); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	return operationError(ctx, name, "shell close", s.backend.Close(ctx, h, id))
+	return operationError(ctx, name, "shell close", backend.Close(ctx, h, id))
 }
