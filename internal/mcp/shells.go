@@ -25,6 +25,15 @@ type shellSendInput struct {
 	ShellID string `json:"shell_id"`
 	Input   string `json:"input" jsonschema:"Literal terminal input; include a newline to execute a command. No newline is added automatically."`
 }
+type shellWaitInput struct {
+	Host      string `json:"host"`
+	ShellID   string `json:"shell_id"`
+	Cursor    string `json:"cursor,omitempty" jsonschema:"Opaque cursor from a previous read or wait. Only output after it is considered."`
+	Until     string `json:"until,omitempty" jsonschema:"Optional literal to wait for. Mutually exclusive with regex."`
+	Regex     string `json:"regex,omitempty" jsonschema:"Optional regular expression to wait for. Mutually exclusive with until."`
+	TimeoutMS int64  `json:"timeout_ms" jsonschema:"Required positive timeout in milliseconds, at most 300000."`
+}
+
 type shellListOutput struct {
 	Shells []shell.Info `json:"shells"`
 }
@@ -51,6 +60,14 @@ func registerShellTools(server *sdk.Server, s *service.ShellService) {
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_read", Description: "Read shell terminal output. Without cursor, returns a bounded snapshot of output and available scrollback. With cursor, returns only output added since that read, or a full snapshot with resync=true. Includes merged stdout/stderr. Requires exec capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellInput) (*sdk.CallToolResult, shell.Output, error) {
 		output, err := s.Read(ctx, in.Host, in.ShellID, in.Cursor)
 		return nil, output, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_wait", Description: "Wait for new shell output, or for a literal (until) or regular expression (regex) to appear, with a strict timeout. Does not close the shell on timeout. Requires exec capability. This observes terminal output, not command completion or exit status."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellWaitInput) (*sdk.CallToolResult, shell.WaitResult, error) {
+		timeout, err := service.TimeoutMillis(in.TimeoutMS)
+		if err != nil {
+			return nil, shell.WaitResult{}, err
+		}
+		result, err := s.Wait(ctx, in.Host, in.ShellID, shell.WaitRequest{Cursor: in.Cursor, Literal: in.Until, Regex: in.Regex, Timeout: timeout})
+		return nil, result, err
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_close", Description: "Close one ASH-owned persistent shell and clean up its backend session. Requires exec capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellInput) (*sdk.CallToolResult, shellCloseOutput, error) {
 		err := s.Close(ctx, in.Host, in.ShellID)

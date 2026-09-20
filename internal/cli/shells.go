@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"ash/internal/service"
 	"ash/internal/shell"
@@ -96,6 +97,8 @@ func runShell(ctx context.Context, args []string, s *service.ShellService, in io
 			_, err = fmt.Fprintln(errout, "ash: shell output truncated")
 		}
 		return err
+	case "wait":
+		return runShellWait(ctx, s, args, name, out)
 	case "close":
 		if len(args) != 3 {
 			return fmt.Errorf("shell close requires HOST ID")
@@ -104,6 +107,62 @@ func runShell(ctx context.Context, args []string, s *service.ShellService, in io
 	default:
 		return fmt.Errorf("unknown shell operation %q", operation)
 	}
+}
+
+func runShellWait(ctx context.Context, s *service.ShellService, args []string, name string, out io.Writer) error {
+	if len(args) < 3 {
+		return fmt.Errorf("shell wait requires HOST ID [--cursor VALUE] [--until TEXT|--regex EXPR] [--timeout DURATION] [--json]")
+	}
+	req := shell.WaitRequest{Timeout: 30 * time.Second}
+	asJSON := false
+	need := func(i *int, flag string) (string, error) {
+		*i = *i + 1
+		if *i == len(args) {
+			return "", fmt.Errorf("%s requires a value", flag)
+		}
+		return args[*i], nil
+	}
+	for i := 3; i < len(args); i++ {
+		arg := args[i]
+		var err error
+		switch {
+		case arg == "--json":
+			asJSON = true
+		case arg == "--cursor":
+			req.Cursor, err = need(&i, "--cursor")
+		case strings.HasPrefix(arg, "--cursor="):
+			req.Cursor = strings.TrimPrefix(arg, "--cursor=")
+		case arg == "--until":
+			req.Literal, err = need(&i, "--until")
+		case strings.HasPrefix(arg, "--until="):
+			req.Literal = strings.TrimPrefix(arg, "--until=")
+		case arg == "--regex":
+			req.Regex, err = need(&i, "--regex")
+		case strings.HasPrefix(arg, "--regex="):
+			req.Regex = strings.TrimPrefix(arg, "--regex=")
+		case arg == "--timeout":
+			var value string
+			if value, err = need(&i, "--timeout"); err == nil {
+				req.Timeout, err = time.ParseDuration(value)
+			}
+		case strings.HasPrefix(arg, "--timeout="):
+			req.Timeout, err = time.ParseDuration(strings.TrimPrefix(arg, "--timeout="))
+		default:
+			return fmt.Errorf("unknown shell wait option %q", arg)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	result, err := s.Wait(ctx, name, args[2], req)
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		return json.NewEncoder(out).Encode(result)
+	}
+	_, err = io.WriteString(out, result.Content)
+	return err
 }
 
 // readInput bounds input and interrupts a pipe read when the process is canceled.

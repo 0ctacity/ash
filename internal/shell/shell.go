@@ -6,9 +6,13 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"time"
 )
 
 const MaxInputSize = 64 << 10
+
+// MaxWaitOutputSize bounds the new output accumulated by one Wait call.
+const MaxWaitOutputSize = 8 << 20
 
 var (
 	ErrInvalidID   = errors.New("invalid shell ID")
@@ -45,6 +49,24 @@ type Info struct {
 	ID      string `json:"id"`
 	Host    string `json:"host"`
 	Backend string `json:"backend"`
+}
+
+// WaitRequest blocks until new output arrives or a matcher is satisfied.
+type WaitRequest struct {
+	Cursor  string
+	Literal string
+	Regex   string
+	Timeout time.Duration
+}
+
+// WaitResult reports newly observed output and the cursor for the next call.
+type WaitResult struct {
+	Content   string `json:"content"`
+	Cursor    string `json:"cursor"`
+	Matched   bool   `json:"matched"`
+	Truncated bool   `json:"truncated"`
+	Resync    bool   `json:"resync"`
+	TimedOut  bool   `json:"timed_out"`
 }
 type Backend interface {
 	Name() string
