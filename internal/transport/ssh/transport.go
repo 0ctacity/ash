@@ -14,6 +14,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -73,6 +74,39 @@ func (r *sshResource) close() error {
 		return nil
 	}
 	return r.client.Close()
+}
+
+// errIdentityMissing reports an identity file that does not exist and is
+// allowed to be skipped.
+var errIdentityMissing = errors.New("identity file does not exist")
+
+// selectIdentities returns the identity paths to load and whether they are
+// explicitly configured in ASH. Identities resolved from `ssh -G` include
+// OpenSSH's default candidate paths regardless of existence, so a missing one
+// must be skipped the way OpenSSH skips it; an explicit ASH identity is a
+// deliberate instruction and stays strict.
+func selectIdentities(h host.Host) (paths []string, explicit bool) {
+	if len(h.Identities) == 0 && h.Identity != "" {
+		return []string{h.Identity}, true
+	}
+	return h.Identities, false
+}
+
+// loadIdentityFile reads and parses one identity file. When missingOK is set,
+// a file that does not exist yields errIdentityMissing instead of an error.
+func loadIdentityFile(path string, missingOK bool) (gossh.Signer, error) {
+	key, err := os.ReadFile(path)
+	if err != nil {
+		if missingOK && errors.Is(err, fs.ErrNotExist) {
+			return nil, errIdentityMissing
+		}
+		return nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
+	}
+	signer, err := gossh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse identity: %v", transport.ErrAuthentication, err)
+	}
+	return signer, nil
 }
 
 func (t *Transport) knownHosts() (gossh.HostKeyCallback, error) {
@@ -174,25 +208,20 @@ func (t *Transport) dial(ctx context.Context, h host.Host) (*gossh.Client, error
 			}
 		}
 	}
-	identities := h.Identities
-	if len(identities) == 0 && h.Identity != "" {
-		identities = []string{h.Identity}
-	}
+	identities, strict := selectIdentities(h)
 	for _, identity := range identities {
 		path, err := expandHome(identity)
 		if err != nil {
 			cleanupAgent()
 			return nil, err
 		}
-		key, err := os.ReadFile(path)
+		signer, err := loadIdentityFile(path, !strict)
 		if err != nil {
+			if errors.Is(err, errIdentityMissing) {
+				continue
+			}
 			cleanupAgent()
-			return nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
-		}
-		signer, err := gossh.ParsePrivateKey(key)
-		if err != nil {
-			cleanupAgent()
-			return nil, fmt.Errorf("%w: parse identity: %v", transport.ErrAuthentication, err)
+			return nil, err
 		}
 		allSigners = append(allSigners, signer)
 	}
