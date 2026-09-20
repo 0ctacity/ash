@@ -11,6 +11,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"ash/internal/audit"
 	"ash/internal/cli"
 	"ash/internal/config"
 	"ash/internal/host"
@@ -60,6 +61,14 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	hosts := host.New(c.Hosts)
 	s := service.New(hosts, t)
 	shells := service.NewShells(hosts, zellij.New(t))
+	if c.AuditLog != "" {
+		recorder, err := audit.New(c.AuditLog)
+		if err != nil {
+			return fail(err)
+		}
+		s.WithAudit(recorder)
+		shells.WithAudit(recorder)
+	}
 	if args[0] == "mcp" {
 		if len(args) != 1 {
 			return fail(fmt.Errorf("mcp takes no arguments"))

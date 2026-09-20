@@ -3,14 +3,22 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"ash/internal/audit"
 	"ash/internal/host"
 	"ash/internal/policy"
 	"ash/internal/transport"
 )
 
-type fakeTransport struct{ calls int }
+type fakeTransport struct {
+	transport.Transport
+	calls int
+}
 
 func (f *fakeTransport) Exec(context.Context, host.Host, transport.ExecRequest) (transport.ExecResult, error) {
 	f.calls++
@@ -83,6 +91,124 @@ func TestCanceledAndOversizedRequestsDoNotReachTransport(t *testing.T) {
 		t.Fatalf("transport called %d times", f.calls)
 	}
 }
+
+type policyTransport struct {
+	transport.Transport
+	canonical   map[string]string
+	execRequest transport.ExecRequest
+	reads       int
+}
+
+func (f *policyTransport) Canonicalize(_ context.Context, _ host.Host, p string) (string, error) {
+	if c, ok := f.canonical[p]; ok {
+		return c, nil
+	}
+	return p, nil
+}
+func (f *policyTransport) Exec(_ context.Context, _ host.Host, req transport.ExecRequest) (transport.ExecResult, error) {
+	f.execRequest = req
+	return transport.ExecResult{}, nil
+}
+func (f *policyTransport) Read(context.Context, host.Host, string) ([]byte, error) {
+	f.reads++
+	return []byte("data"), nil
+}
+
+func policyService(t *testing.T, f *policyTransport, pol policy.Policy) *Service {
+	t.Helper()
+	return New(host.New(map[string]host.Host{"h": {Policy: pol}}), f)
+}
+
+func TestShellBypassAndExecutableConstraints(t *testing.T) {
+	f := new(policyTransport)
+	s := policyService(t, f, policy.Policy{Exec: true, AllowedCommands: []string{"ls"}})
+	ctx := context.Background()
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "ls -la"}); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("shell code with constraints: %v", err)
+	}
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Argv: []string{"rm", "-rf", "/"}}); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("disallowed executable: %v", err)
+	}
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Argv: []string{"ls", "-la"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.execRequest.Argv) != 2 || f.execRequest.Argv[0] != "ls" {
+		t.Fatalf("%+v", f.execRequest)
+	}
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "true", Argv: []string{"ls"}}); err == nil {
+		t.Fatal("accepted command and argv together")
+	}
+}
+
+func TestExecCwdRoots(t *testing.T) {
+	f := &policyTransport{canonical: map[string]string{"/etc": "/etc", "/work/x": "/work/x"}}
+	s := policyService(t, f, policy.Policy{Exec: true, CwdRoots: []string{"/work"}})
+	ctx := context.Background()
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "true", Cwd: "/etc"}); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("cwd outside roots: %v", err)
+	}
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "true", Cwd: "/work/x"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadRootsEnforcedBeforeTransport(t *testing.T) {
+	f := &policyTransport{canonical: map[string]string{"/etc/passwd": "/etc/passwd", "/allowed/x": "/allowed/x"}}
+	s := policyService(t, f, policy.Policy{Read: true, ReadRoots: []string{"/allowed"}})
+	ctx := context.Background()
+	if _, err := s.Read(ctx, "h", "/etc/passwd"); !errors.Is(err, policy.ErrPermissionDenied) {
+		t.Fatalf("read outside roots: %v", err)
+	}
+	if f.reads != 0 {
+		t.Fatal("denied read reached transport")
+	}
+	if _, err := s.Read(ctx, "h", "/allowed/x"); err != nil || f.reads != 1 {
+		t.Fatalf("%v reads=%d", err, f.reads)
+	}
+}
+
+func TestTimeoutAndOutputCaps(t *testing.T) {
+	f := new(policyTransport)
+	s := policyService(t, f, policy.Policy{Exec: true, MaxTimeoutSeconds: 60, MaxOutputBytes: 1024})
+	if _, err := s.Exec(context.Background(), transport.ExecRequest{Host: "h", Command: "true", Timeout: 10 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+	if f.execRequest.Timeout > 60*time.Second {
+		t.Fatalf("timeout not capped: %v", f.execRequest.Timeout)
+	}
+	if f.execRequest.MaxOutput != 1024 {
+		t.Fatalf("output cap not applied: %d", f.execRequest.MaxOutput)
+	}
+}
+
+func TestAuditRecordsDeniedAndAllowed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	recorder, err := audit.New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}, "denied": {}}), new(policyTransport))
+	s.WithAudit(recorder)
+	ctx := context.Background()
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "true"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "denied", Command: "true"}); err == nil {
+		t.Fatal("denied exec accepted")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"decision":"allowed"`) || !strings.Contains(text, `"decision":"denied"`) {
+		t.Fatalf("audit missing decisions: %s", text)
+	}
+	if strings.Contains(text, "command") {
+		t.Fatalf("audit leaked command: %s", text)
+	}
+}
+
 func TestTextAndWireTimeoutValidation(t *testing.T) {
 	if _, err := Text([]byte{0xff}); err == nil {
 		t.Fatal("invalid UTF-8 accepted")

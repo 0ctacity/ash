@@ -36,6 +36,22 @@ func TestExecPreservesCommandAndExit(t *testing.T) {
 		t.Fatalf("%+v", r.request)
 	}
 }
+func TestExecvUsesArgv(t *testing.T) {
+	r := new(recorder)
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), r)
+	var out, errout bytes.Buffer
+	code := Run(context.Background(), []string{"execv", "h", "--", "printf", "%s", "a b"}, s, nil, strings.NewReader(""), &out, &errout)
+	if code != 9 {
+		t.Fatalf("%d %q", code, errout.String())
+	}
+	if len(r.request.Argv) != 3 || r.request.Argv[0] != "printf" || r.request.Argv[2] != "a b" || r.request.Command != "" {
+		t.Fatalf("%+v", r.request)
+	}
+	if code := Run(context.Background(), []string{"execv", "h", "true"}, s, nil, strings.NewReader(""), &out, &errout); code != 1 {
+		t.Fatal("accepted execv without delimiter")
+	}
+}
+
 func TestExecRequiresDelimiter(t *testing.T) {
 	var out bytes.Buffer
 	if c := Run(context.Background(), []string{"exec", "h", "true"}, nil, nil, strings.NewReader(""), &out, &out); c != 1 {

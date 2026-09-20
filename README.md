@@ -64,12 +64,42 @@ ssh ata@100.64.1.20
 
 Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH aliases, `ProxyJump`, or other `~/.ssh/config` settings. Listing hosts and starting MCP do not require a connection or a known-hosts file; remote operations require a trusted host key.
 
+### Restrict a host
+
+Capabilities can be narrowed without breaking existing configuration:
+
+```toml
+[hosts.fedora.policy]
+exec = true
+read = true
+write = true
+read_roots = ["/var/log", "/srv/app"]
+write_roots = ["/srv/app"]
+cwd_roots = ["/srv/app"]
+allowed_commands = ["systemctl", "cat"]
+# allow_shell = true          # required to keep shell-code exec once allowed_commands is set
+max_timeout_seconds = 30
+max_input_bytes = 65536
+max_output_bytes = 1048576
+```
+
+Roots are **remote absolute POSIX paths**. Empty fields preserve the previous broad behavior. Paths are canonicalized through SFTP (`realpath` of the target, or of the nearest existing parent for a create) and enforced component-wise before the operation, so symlink escapes are rejected. `allowed_commands` restricts argv execution only; shell code can invoke anything, so when it is set ASH refuses shell-code `exec` unless `allow_shell = true`, which explicitly bypasses executable restrictions. Timeout, input, and output bounds allow a request to choose *smaller* values but never larger ones, and configurable bounds may not exceed the compiled hard caps.
+
+Set a top-level `audit_log` to append structured, local JSONL records of operations:
+
+```toml
+audit_log = "~/.local/state/ash/audit.jsonl"
+```
+
+Each record contains the time, operation, ASH host, policy decision, duration, result category, byte counts, and truncation. Records deliberately omit command text, argv values, paths, file contents, environment variables, credentials, stdout, and stderr. The file is created owner-only (`0600`). Audit writes are fail-open: a write error never fails the operation.
+
 ## CLI
 
 ```sh
 ./ash hosts
 ./ash exec fedora -- uname -a
 ./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
+./ash execv fedora -- systemctl is-active nginx
 ./ash read fedora /etc/os-release
 printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 ./ash stat fedora /tmp/ash-test.txt
@@ -82,6 +112,8 @@ printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 ```
 
 `cwd` and environment values are escaped as literal values; environment names must be valid shell identifiers. Execution assumes a POSIX-compatible remote shell. Quote remote `~/` paths so your local shell does not expand them. SFTP resolves `~/` against its initial remote directory, normally the user's home.
+
+`execv` runs a structured `PROGRAM ARG...` without a shell, quoting every word literally, so `allowed_commands` can be enforced. It shares `--cwd`, `--env`, and `--timeout` with `exec`.
 
 Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts` and `stat` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Writes are not atomic and interruption may leave a partial file.
 
@@ -134,7 +166,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | Tool | Inputs | Result |
 | --- | --- | --- |
 | `ash_hosts` | `{}` | Public host metadata and capabilities |
-| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
+| `ash_exec` | `host`, `command` **or** `argv`; optional `cwd`, `env`, `timeout_ms` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
 | `ash_read` | `host`, `path` | UTF-8 `content` and byte `size` |
 | `ash_write` | `host`, `path`, `content` | Written byte `size` |
 | `ash_stat` | `host`, `path` | `path`, `size`, `mode`, `is_dir`, `modified_at` |
@@ -146,7 +178,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 
 A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.
 
-Capabilities grant access with the remote account's permissions. They do not constrain paths or commands: an enabled `exec` capability can itself read or modify files. Configure only hosts and accounts you intend the connected agent to operate.
+Capabilities grant access with the remote account's permissions. A bare boolean `exec`/`read`/`write` does not constrain paths or commands, and an enabled `exec` capability can itself read or modify files. Optional policy fields (`read_roots`, `write_roots`, `cwd_roots`, `allowed_commands`, `allow_shell`, bound settings) add enforcement; configure only hosts and accounts you intend the connected agent to operate.
 
 ## Architecture
 

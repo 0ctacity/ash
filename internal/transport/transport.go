@@ -27,6 +27,12 @@ type ExecRequest struct {
 	Host, Command, Cwd string
 	Env                map[string]string
 	Timeout            time.Duration
+	// Argv, when non-empty, is executed as structured program arguments with
+	// strict POSIX quoting instead of shell code. Command and Argv are
+	// mutually exclusive.
+	Argv []string
+	// MaxOutput caps each captured stream when smaller than MaxOutputSize.
+	MaxOutput int
 }
 type ExecResult struct {
 	ExitCode                         int
@@ -46,4 +52,5 @@ type Transport interface {
 	Read(context.Context, host.Host, string) ([]byte, error)
 	Write(context.Context, host.Host, string, []byte) error
 	Stat(context.Context, host.Host, string) (FileInfo, error)
+	Canonicalize(context.Context, host.Host, string) (string, error)
 }
