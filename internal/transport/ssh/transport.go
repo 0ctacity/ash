@@ -1,4 +1,7 @@
-// Package ssh implements one verified SSH connection per remote operation.
+// Package ssh implements a verified SSH transport whose connections are pooled
+// and reused across operations. Connections are keyed by host and all
+// authentication material, health-checked before reuse, and bounded by idle
+// limits and lifetime.
 package ssh
 
 import (
@@ -18,25 +21,58 @@ import (
 	"strings"
 )
 
-type Transport struct{ knownHostsPath string }
-
-func New(knownHostsPath string) (*Transport, error) {
-	return &Transport{knownHostsPath: knownHostsPath}, nil
+type Transport struct {
+	knownHostsPath string
+	pool           *resourcePool
 }
 
-// expandHome resolves a leading ~/ against the local home directory.
-func expandHome(path string) (string, error) {
-	if path == "~" || strings.HasPrefix(path, "~/") {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		if path == "~" {
-			return home, nil
-		}
-		return filepath.Join(home, path[2:]), nil
+func New(knownHostsPath string) (*Transport, error) {
+	return &Transport{
+		knownHostsPath: knownHostsPath,
+		pool:           newResourcePool(DefaultMaxConnections, DefaultMaxIdlePerHost, DefaultIdleLifetime, nil),
+	}, nil
+}
+
+// Close shuts down the connection pool, closing every idle connection. Active
+// operations keep their own connection until they finish.
+func (t *Transport) Close() { t.pool.Close() }
+
+// keyFor derives the reuse boundary for a host. Host, authentication material,
+// agent, host-key alias, and trust file must all match.
+func keyFor(h host.Host, knownHostsPath string) connKey {
+	return connKey{
+		address:      h.Address,
+		port:         h.Port,
+		user:         h.User,
+		identity:     h.Identity,
+		identities:   strings.Join(h.Identities, "\x00"),
+		agent:        h.AgentSocket,
+		hostKeyAlias: h.HostKeyAlias,
+		knownHosts:   knownHostsPath,
 	}
-	return path, nil
+}
+
+// sshResource adapts a pooled SSH client to the pool's resource contract.
+type sshResource struct {
+	client    *gossh.Client
+	lifecycle resourceLifecycle
+}
+
+func (r *sshResource) alive() bool {
+	if r.client == nil {
+		return false
+	}
+	_, _, err := r.client.SendRequest("keepalive@openssh.com", true, nil)
+	return err == nil
+}
+
+func (r *sshResource) setLifecycle(lc resourceLifecycle) { r.lifecycle = lc }
+
+func (r *sshResource) close() error {
+	if r.client == nil {
+		return nil
+	}
+	return r.client.Close()
 }
 
 func (t *Transport) knownHosts() (gossh.HostKeyCallback, error) {
@@ -51,6 +87,7 @@ func (t *Transport) knownHosts() (gossh.HostKeyCallback, error) {
 		return nil
 	}, nil
 }
+
 func operationError(ctx context.Context, err error) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return fmt.Errorf("%w: %w", transport.ErrTimeout, ctx.Err())
@@ -60,13 +97,54 @@ func operationError(ctx context.Context, err error) error {
 	}
 	return err
 }
+
+// expandHome resolves a leading ~ against the local home directory.
+func expandHome(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
+}
+
+// connect returns a pooled or freshly dialed client. The returned release
+// function returns the connection to the pool for reuse; it never closes a
+// healthy connection. Connection lifetime is intentionally independent of the
+// per-operation context.
 func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, operationError(ctx, err)
 	}
+	key := keyFor(h, t.knownHostsPath)
+	if res, ok := t.pool.get(key); ok {
+		return res.(*sshResource).client, func() { t.pool.put(key, res) }, nil
+	}
+	if err := t.pool.reserve(ctx); err != nil {
+		return nil, nil, operationError(ctx, err)
+	}
+	client, err := t.dial(ctx, h)
+	if err != nil {
+		t.pool.releaseSlot()
+		return nil, nil, err
+	}
+	res := &sshResource{client: client}
+	return client, func() { t.pool.put(key, res) }, nil
+}
+
+// dial establishes a fresh, verified connection. The returned cleanup closes
+// the connection and any agent socket it opened; it is only valid for
+// connections that fail before entering the pool. A pooled connection is never
+// closed by the caller; release returns it to the pool instead.
+func (t *Transport) dial(ctx context.Context, h host.Host) (*gossh.Client, error) {
 	hostKey, err := t.knownHosts()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var agentConn net.Conn
 	var stopAgent func() bool
@@ -104,27 +182,27 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 		path, err := expandHome(identity)
 		if err != nil {
 			cleanupAgent()
-			return nil, nil, err
+			return nil, err
 		}
 		key, err := os.ReadFile(path)
 		if err != nil {
 			cleanupAgent()
-			return nil, nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
+			return nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
 		}
 		signer, err := gossh.ParsePrivateKey(key)
 		if err != nil {
 			cleanupAgent()
-			return nil, nil, fmt.Errorf("%w: parse identity: %v", transport.ErrAuthentication, err)
+			return nil, fmt.Errorf("%w: parse identity: %v", transport.ErrAuthentication, err)
 		}
 		allSigners = append(allSigners, signer)
 	}
 	if ctx.Err() != nil {
 		cleanupAgent()
-		return nil, nil, operationError(ctx, ctx.Err())
+		return nil, operationError(ctx, ctx.Err())
 	}
 	if len(allSigners) == 0 {
 		cleanupAgent()
-		return nil, nil, fmt.Errorf("%w: no SSH agent keys or identity available", transport.ErrAuthentication)
+		return nil, fmt.Errorf("%w: no SSH agent keys or identity available", transport.ErrAuthentication)
 	}
 	port := h.Port
 	if port == 0 {
@@ -139,7 +217,7 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", dialAddress)
 	if err != nil {
 		cleanupAgent()
-		return nil, nil, operationError(ctx, fmt.Errorf("connect to host %q: %w", h.Name, err))
+		return nil, operationError(ctx, fmt.Errorf("connect to host %q: %w", h.Name, err))
 	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	cleanup := func() { stop(); conn.Close(); cleanupAgent() }
@@ -151,10 +229,15 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 		if strings.Contains(err.Error(), "unable to authenticate") {
 			err = fmt.Errorf("%w: %v", transport.ErrAuthentication, err)
 		}
-		return nil, nil, err
+		return nil, err
 	}
 	client := gossh.NewClient(sshConn, chans, reqs)
-	return client, func() { client.Close(); cleanup() }, nil
+	// Once the handshake succeeds the per-dial resources belong to the
+	// long-lived connection: the context stop and agent socket must stay alive
+	// until the connection itself closes.
+	res := &sshResource{client: client}
+	t.pool.trackResources(res, stop, cleanup)
+	return client, nil
 }
 
 // preferredHostKeyAlgorithms asks the known_hosts matcher for this host's keys

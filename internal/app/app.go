@@ -70,6 +70,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	if err != nil {
 		return fail(err)
 	}
+	defer t.Close()
 	hosts := host.New(c.Hosts)
 	s := service.New(hosts, t)
 	shells := service.NewShells(hosts, zellij.New(t))
