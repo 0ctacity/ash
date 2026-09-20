@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/pelletier/go-toml/v2"
 )
 
 // setHome redirects the per-user directory that os.UserHomeDir resolves on
@@ -180,5 +182,48 @@ func TestUnsupportedAgentAndManualExample(t *testing.T) {
 	_, err := Run(baseOpts(t, "claude", UserScope, ""))
 	if err == nil || !strings.Contains(err.Error(), "Manual configuration example") || !strings.Contains(err.Error(), "mcpServers") {
 		t.Fatalf("%v", err)
+	}
+}
+
+func TestCodexQuotedHeaderIsReplacedNotDuplicated(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	t.Setenv("CODEX_HOME", "")
+	path := filepath.Join(home, ".codex", "config.toml")
+	// The quoted key spelling is the same TOML table as [mcp_servers.ash].
+	original := "[mcp_servers.\"ash\"]\ncommand = \"old\"\n\n[other]\nx = 1\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opts := baseOpts(t, "codex", UserScope, "")
+	result, err := Run(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Written {
+		t.Fatalf("expected write: %+v", result)
+	}
+	if strings.Count(result.Content, "mcp_servers") > 2 {
+		t.Fatalf("duplicate ASH definitions:\n%s", result.Content)
+	}
+	if strings.Contains(result.Content, `"old"`) {
+		t.Fatalf("stale command kept:\n%s", result.Content)
+	}
+	if !strings.Contains(result.Content, opts.AshPath) || !strings.Contains(result.Content, "[other]") {
+		t.Fatalf("missing expected content:\n%s", result.Content)
+	}
+	// The result must parse as valid TOML with exactly one ash entry.
+	content, _ := os.ReadFile(path)
+	var doc struct {
+		MCPServers map[string]any `toml:"mcp_servers"`
+	}
+	if err := toml.Unmarshal(content, &doc); err != nil {
+		t.Fatalf("output is not valid TOML: %v\n%s", err, content)
+	}
+	if len(doc.MCPServers) != 1 {
+		t.Fatalf("expected exactly one mcp_servers entry, got %d:\n%s", len(doc.MCPServers), content)
 	}
 }

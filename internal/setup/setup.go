@@ -77,11 +77,13 @@ func adapters() []Adapter {
 			Restart: "Restart OpenCode so it reloads its config and starts the ASH MCP server.",
 		},
 		{
-			Name:    "freebuff",
-			Scopes:  []Scope{ProjectScope},
-			Path:    freebuffPath,
-			Render:  renderFreebuff,
-			Restart: "Restart freebuff from the project directory so it reloads .agents/mcp.json.",
+			Name:   "freebuff",
+			Scopes: []Scope{ProjectScope},
+			Path:   freebuffPath,
+			Render: renderFreebuff,
+			Restart: "Restart freebuff from the project directory so it reloads .agents/mcp.json. " +
+				"Freebuff trust-gates project MCP files: on first use it asks you to approve " +
+				"this directory's .agents/mcp.json; accept that prompt to enable the ASH tools.",
 		},
 	}
 }
@@ -262,12 +264,46 @@ func renderCodex(existing []byte, command []string) ([]byte, error) {
 	}
 	header := "[mcp_servers.ash]"
 	section := header + "\n" + string(block)
-	return []byte(upsertTOMLSection(string(existing), header, section)), nil
+	// An existing ASH table can be spelled with quoted keys, e.g.
+	// [mcp_servers."ash"], which is the same TOML table. Detect membership
+	// semantically first so the textual upsert replaces instead of appending
+	// a duplicate definition.
+	present, err := tomlHasAshServer(existing)
+	if err != nil {
+		return nil, err
+	}
+	result, err := upsertTOMLSection(string(existing), header, section, present)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(result), nil
+}
+
+// tomlHasAshServer reports whether the document already defines
+// mcp_servers.ash under any valid key spelling, and whether the document
+// parses at all.
+func tomlHasAshServer(existing []byte) (bool, error) {
+	trimmed := strings.TrimSpace(string(existing))
+	if trimmed == "" {
+		return false, nil
+	}
+	var doc struct {
+		MCPServers map[string]any `toml:"mcp_servers"`
+	}
+	if err := toml.Unmarshal(existing, &doc); err != nil {
+		return false, fmt.Errorf("parse existing config: %w", err)
+	}
+	_, ok := doc.MCPServers["ash"]
+	return ok, nil
 }
 
 // upsertTOMLSection replaces the table whose header is exactly `header`, or
-// appends it. It preserves every other line of the document, including comments.
-func upsertTOMLSection(doc, header, section string) string {
+// appends it. When `present` is true (an existing ASH table under any key
+// spelling), a duplicate append is skipped only when the literal header is
+// absent - meaning the table exists solely in quoted form, which must be
+// rewritten in place, not duplicated. It preserves every other line of the
+// document, including comments.
+func upsertTOMLSection(doc, header, section string, present bool) (string, error) {
 	doc = strings.TrimRight(doc, "\n")
 	lines := strings.Split(doc, "\n")
 	sectionLines := strings.Split(strings.TrimRight(section, "\n"), "\n")
@@ -277,6 +313,13 @@ func upsertTOMLSection(doc, header, section string) string {
 			start = i
 			break
 		}
+	}
+	if start == -1 && present {
+		// The ASH table exists only under a quoted spelling. Rewriting it in
+		// place would require splicing into an arbitrary position; the safe,
+		// lossless move is to canonicalize through a full parse so the result
+		// has exactly one definition.
+		return rewriteTOMLCanonical(doc, section)
 	}
 	var out []string
 	if start == -1 {
@@ -297,7 +340,37 @@ func upsertTOMLSection(doc, header, section string) string {
 		out = append(out, sectionLines...)
 		out = append(out, lines[end:]...)
 	}
-	return strings.Join(out, "\n") + "\n"
+	return strings.Join(out, "\n") + "\n", nil
+}
+
+// rewriteTOMLCanonical re-renders the whole document with mcp_servers.ash
+// replaced by the canonical section. This is the fallback when the ASH table
+// exists only under a quoted key spelling that textual splicing cannot find:
+// the result is semantically identical with exactly one ASH definition, at
+// the cost of comment placement inside the document.
+func rewriteTOMLCanonical(doc, section string) (string, error) {
+	var root map[string]any
+	if err := toml.Unmarshal([]byte(doc), &root); err != nil {
+		return "", fmt.Errorf("parse existing config: %w", err)
+	}
+	var ashSection map[string]any
+	if err := toml.Unmarshal([]byte(section), &ashSection); err != nil {
+		return "", err
+	}
+	servers, _ := root["mcp_servers"].(map[string]any)
+	if servers == nil {
+		servers = map[string]any{}
+	}
+	ash, _ := ashSection["mcp_servers"].(map[string]any)
+	if entry, ok := ash["ash"]; ok {
+		servers["ash"] = entry
+	}
+	root["mcp_servers"] = servers
+	out, err := toml.Marshal(root)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func renderOpenCode(existing []byte, command []string) ([]byte, error) {
