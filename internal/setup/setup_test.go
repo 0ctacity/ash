@@ -7,20 +7,39 @@ import (
 	"testing"
 )
 
+// setHome redirects the per-user directory that os.UserHomeDir resolves on
+// every platform: HOME covers POSIX, USERPROFILE covers Windows.
+func setHome(t *testing.T, home string) {
+	t.Helper()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+}
+
 func baseOpts(t *testing.T, agent string, scope Scope, projectDir string) Options {
 	t.Helper()
+	// Absolute POSIX-shaped inputs, matching how callers pass installed paths.
+	// filepath.Abs normalizes them per-platform (a no-op on POSIX, a drive
+	// prefix on Windows), so assertions use the normalized forms below.
+	ashPath := "/usr/local/bin/ash"
+	configPath := "/home/user/.config/ash/config.toml"
+	if abs, err := filepath.Abs(ashPath); err == nil {
+		ashPath = abs
+	}
+	if abs, err := filepath.Abs(configPath); err == nil {
+		configPath = abs
+	}
 	return Options{
 		Agent:      agent,
 		Scope:      scope,
 		ProjectDir: projectDir,
-		AshPath:    "/usr/local/bin/ash",
-		ConfigPath: "/home/user/.config/ash/config.toml",
+		AshPath:    ashPath,
+		ConfigPath: configPath,
 	}
 }
 
 func TestCodexSetupPreservesUnrelatedAndIsIdempotent(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	path := filepath.Join(home, ".codex", "config.toml")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -30,7 +49,8 @@ func TestCodexSetupPreservesUnrelatedAndIsIdempotent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Run(baseOpts(t, "codex", UserScope, ""))
+	opts := baseOpts(t, "codex", UserScope, "")
+	result, err := Run(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +58,7 @@ func TestCodexSetupPreservesUnrelatedAndIsIdempotent(t *testing.T) {
 		t.Fatalf("%+v", result)
 	}
 	content := result.Content
-	for _, want := range []string{`model = "gpt-5"`, "[mcp_servers.other]", "[mcp_servers.ash]", "/usr/local/bin/ash", "--config", "/home/user/.config/ash/config.toml", "mcp"} {
+	for _, want := range []string{`model = "gpt-5"`, "[mcp_servers.other]", "[mcp_servers.ash]", opts.AshPath, "--config", opts.ConfigPath, "mcp"} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("missing %q in:\n%s", want, content)
 		}
@@ -61,7 +81,7 @@ func TestCodexSetupPreservesUnrelatedAndIsIdempotent(t *testing.T) {
 
 func TestCodexSetupUpdatesExistingEntry(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	path := filepath.Join(home, ".codex", "config.toml")
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -85,7 +105,7 @@ func TestCodexSetupUpdatesExistingEntry(t *testing.T) {
 
 func TestOpenCodeSetupPreservesOtherKeys(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	path := filepath.Join(home, ".config", "opencode", "opencode.json")
 	original := `{"theme":"dark","mcp":{"existing":{"type":"local","command":["x"]}}}`
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -94,11 +114,12 @@ func TestOpenCodeSetupPreservesOtherKeys(t *testing.T) {
 	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	result, err := Run(baseOpts(t, "opencode", UserScope, ""))
+	opts := baseOpts(t, "opencode", UserScope, "")
+	result, err := Run(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"theme": "dark"`, `"existing"`, `"ash"`, `"type": "local"`, `"enabled": true`, `https://opencode.ai/config.json`, `"/usr/local/bin/ash"`} {
+	for _, want := range []string{`"theme": "dark"`, `"existing"`, `"ash"`, `"type": "local"`, `"enabled": true`, `https://opencode.ai/config.json`, `"` + opts.AshPath + `"`} {
 		if !strings.Contains(result.Content, want) {
 			t.Fatalf("missing %q in:\n%s", want, result.Content)
 		}
@@ -133,7 +154,7 @@ func TestFreebuffProjectSetupAndScopeRestriction(t *testing.T) {
 
 func TestPrintModeDoesNotWrite(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 	t.Setenv("CODEX_HOME", "")
 	opts := baseOpts(t, "codex", UserScope, "")
 	opts.Print = true
