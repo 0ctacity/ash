@@ -119,10 +119,18 @@ func (d *Doctor) shellCheck(ctx context.Context, h host.Host) Check {
 	return Check{Name: "shell", Status: StatusOK, Message: "POSIX shell available"}
 }
 
+// cacheCheck verifies the remote cache location without mutating the host:
+// it inspects what exists (or what could be created) with a shell test only.
+// A missing ~/.cache/ash is reported as a warning rather than created, since
+// diagnostics must not change the host.
 func (d *Doctor) cacheCheck(ctx context.Context, h host.Host) Check {
-	r, err := d.exec(ctx, h, `mkdir -p -- "$HOME/.cache/ash" && test -w "$HOME/.cache/ash"`)
+	r, err := d.exec(ctx, h, `if [ -d "$HOME/.cache/ash" ]; then test -w "$HOME/.cache/ash"; else test -w "$HOME/.cache" || test -w "$HOME"; fi`)
 	if err != nil || r.ExitCode != 0 {
 		return Check{Name: "cache", Status: StatusFail, Message: "remote cache directory is not writable", Hint: "check permissions on $HOME/.cache"}
+	}
+	exists, _ := d.exec(ctx, h, `test -d "$HOME/.cache/ash"`)
+	if exists.ExitCode != 0 {
+		return Check{Name: "cache", Status: StatusWarn, Message: "remote cache directory is missing; ASH will create it on first use", Hint: "mkdir -p ~/.cache/ash (created automatically later)"}
 	}
 	return Check{Name: "cache", Status: StatusOK, Message: "remote cache directory is writable"}
 }

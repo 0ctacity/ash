@@ -151,3 +151,32 @@ func TestDiagnosticsDoNotEchoIdentityPaths(t *testing.T) {
 		t.Fatalf("%+v", report)
 	}
 }
+
+// Diagnostics must not mutate the host: no mkdir in any issued command.
+func TestCacheCheckDoesNotMutate(t *testing.T) {
+	f := &fakeTransport{}
+	d := testDoctor(t, f, policy.Policy{Exec: true})
+	report := d.Run(context.Background(), "h")
+	_ = report
+	for _, command := range f.commands {
+		if strings.Contains(command, "mkdir") {
+			t.Fatalf("doctor issued a mutating command: %q", command)
+		}
+	}
+	// Missing cache directory yields a warning, not a failure, and ASH would
+	// create it on first use.
+	f2 := &fakeTransport{results: map[string]transport.ExecResult{
+		`test -d "$HOME/.cache/ash"`: {ExitCode: 1},
+	}}
+	d2 := testDoctor(t, f2, policy.Policy{Exec: true})
+	report2 := d2.Run(context.Background(), "h")
+	for _, check := range report2.Checks {
+		if check.Name == "cache" {
+			if check.Status != StatusWarn {
+				t.Fatalf("missing cache dir should warn, got %+v", check)
+			}
+			return
+		}
+	}
+	t.Fatal("cache check missing from report")
+}
