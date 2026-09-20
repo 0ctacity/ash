@@ -18,8 +18,14 @@ const Usage = `Usage:
   ash [--config PATH] hosts
   ash [--config PATH] exec HOST [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
   ash [--config PATH] read HOST PATH
-  ash [--config PATH] write HOST PATH < FILE
+  ash [--config PATH] write HOST PATH [--atomic] < FILE
   ash [--config PATH] stat HOST PATH
+  ash [--config PATH] list HOST PATH
+  ash [--config PATH] mkdir HOST PATH
+  ash [--config PATH] rename HOST FROM TO
+  ash [--config PATH] remove HOST PATH
+  ash [--config PATH] download HOST REMOTE_DIR LOCAL_DIR
+  ash [--config PATH] upload HOST LOCAL_DIR REMOTE_DIR
   ash [--config PATH] shell create HOST [--cwd PATH]
   ash [--config PATH] shell list HOST
   ash [--config PATH] shell send HOST ID [INPUT]
@@ -78,13 +84,12 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 			return 1
 		}
 		return r.ExitCode
-	case "read", "write", "stat":
+	case "read", "stat":
 		if len(args) != 3 {
 			return fail(fmt.Errorf("%s requires HOST PATH", args[0]))
 		}
 		name, path := args[1], args[2]
-		switch args[0] {
-		case "read":
+		if args[0] == "read" {
 			data, err := s.Read(ctx, name, path)
 			if err != nil {
 				return fail(err)
@@ -92,22 +97,63 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 			if _, err := out.Write(data); err != nil {
 				return fail(err)
 			}
-		case "write":
-			data, err := readInput(ctx, in, transport.MaxWriteSize)
-			if err != nil {
-				return fail(err)
-			}
-			if err := s.Write(ctx, name, path, data); err != nil {
-				return fail(err)
-			}
-		case "stat":
-			info, err := s.Stat(ctx, name, path)
-			if err != nil {
-				return fail(err)
-			}
-			if err := json.NewEncoder(out).Encode(info); err != nil {
-				return fail(err)
-			}
+			return 0
+		}
+		info, err := s.Stat(ctx, name, path)
+		if err != nil {
+			return fail(err)
+		}
+		if err := json.NewEncoder(out).Encode(info); err != nil {
+			return fail(err)
+		}
+		return 0
+	case "write":
+		if err := runWrite(ctx, args[1:], s, in); err != nil {
+			return fail(err)
+		}
+		return 0
+	case "list":
+		if len(args) != 3 {
+			return fail(fmt.Errorf("list requires HOST PATH"))
+		}
+		entries, err := s.List(ctx, args[1], args[2])
+		if err != nil {
+			return fail(err)
+		}
+		if err := json.NewEncoder(out).Encode(entries); err != nil {
+			return fail(err)
+		}
+		return 0
+	case "mkdir", "remove":
+		if len(args) != 3 {
+			return fail(fmt.Errorf("%s requires HOST PATH", args[0]))
+		}
+		var opErr error
+		if args[0] == "mkdir" {
+			opErr = s.Mkdir(ctx, args[1], args[2])
+		} else {
+			opErr = s.Remove(ctx, args[1], args[2])
+		}
+		if opErr != nil {
+			return fail(opErr)
+		}
+		return encodeOK(out, fail)
+	case "rename":
+		if len(args) != 4 {
+			return fail(fmt.Errorf("rename requires HOST FROM TO"))
+		}
+		if err := s.Rename(ctx, args[1], args[2], args[3]); err != nil {
+			return fail(err)
+		}
+		return encodeOK(out, fail)
+	case "download":
+		if err := runDownload(ctx, args[1:], s); err != nil {
+			return fail(err)
+		}
+		return 0
+	case "upload":
+		if err := runUpload(ctx, args[1:], s); err != nil {
+			return fail(err)
 		}
 		return 0
 	default:

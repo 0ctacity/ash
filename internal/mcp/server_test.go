@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestToolsAndDeniedExec(t *testing.T) {
 	}
 	defer cs.Close()
 	list, err := cs.ListTools(ctx, nil)
-	if err != nil || len(list.Tools) != 10 {
+	if err != nil || len(list.Tools) != 17 {
 		t.Fatalf("%+v %v", list, err)
 	}
 	res, err := cs.CallTool(ctx, &sdk.CallToolParams{Name: "ash_hosts", Arguments: map[string]any{}})
@@ -56,6 +57,27 @@ func (f *cancelTransport) Exec(ctx context.Context, _ host.Host, _ transport.Exe
 	close(f.canceled)
 	return transport.ExecResult{}, ctx.Err()
 }
+func TestDecodeContentTextAndBinary(t *testing.T) {
+	text := "hi"
+	if data, err := decodeContent(&text, nil); err != nil || string(data) != "hi" {
+		t.Fatalf("%q %v", data, err)
+	}
+	binary := base64.StdEncoding.EncodeToString([]byte{0xff, 0x00})
+	if data, err := decodeContent(nil, &binary); err != nil || len(data) != 2 || data[0] != 0xff {
+		t.Fatalf("%v %v", data, err)
+	}
+	if _, err := decodeContent(&text, &binary); err == nil {
+		t.Fatal("accepted both content fields")
+	}
+	bad := "!!!"
+	if _, err := decodeContent(nil, &bad); err == nil {
+		t.Fatal("accepted invalid base64")
+	}
+	if data, err := decodeContent(nil, nil); err != nil || data != nil {
+		t.Fatalf("%v %v", data, err)
+	}
+}
+
 func TestClientCancellationReachesService(t *testing.T) {
 	ctx, cancelAll := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelAll()

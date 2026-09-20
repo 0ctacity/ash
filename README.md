@@ -72,7 +72,14 @@ Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH
 ./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
 ./ash read fedora /etc/os-release
 printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
+printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt --atomic
 ./ash stat fedora /tmp/ash-test.txt
+./ash list fedora /tmp
+./ash mkdir fedora /tmp/ash-dir
+./ash rename fedora /tmp/ash-dir /tmp/ash-dir2
+./ash remove fedora /tmp/ash-dir2
+./ash download fedora /tmp/remote-tree ./local-tree
+./ash upload fedora ./local-tree /tmp/remote-tree
 ```
 
 `exec` joins everything after `--` with spaces into **shell code**, executed through the remote user's shell. For shell expressions or arguments containing spaces, pass one quoted command string:
@@ -83,7 +90,9 @@ printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 
 `cwd` and environment values are escaped as literal values; environment names must be valid shell identifiers. Execution assumes a POSIX-compatible remote shell. Quote remote `~/` paths so your local shell does not expand them. SFTP resolves `~/` against its initial remote directory, normally the user's home.
 
-Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts` and `stat` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Writes are not atomic and interruption may leave a partial file.
+Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts`, `stat`, and `list` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Pass `--atomic` to `write` to replace the destination through a same-directory temporary file, fsync, and rename, so an interrupted write leaves the prior file intact.
+
+`mkdir` creates one directory without implicit parents. `rename` moves a file or directory. `remove` deletes a file or an empty directory and is never recursive; enumerate a tree with `list` before deleting it. `download` and `upload` map a bounded remote tree to and from a local directory without archives: remote symlinks are skipped, and absolute paths, `..`, NUL, duplicates, type conflicts, depth/entry/byte limits (depth 32, 1000 entries, 4 MiB) are rejected before the first remote mutation. A recursive transfer that fails part-way leaves earlier entries in place; there is no rollback.
 
 Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Each operation opens and closes its own SSH connection.
 
@@ -135,16 +144,23 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | --- | --- | --- |
 | `ash_hosts` | `{}` | Public host metadata and capabilities |
 | `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
-| `ash_read` | `host`, `path` | UTF-8 `content` and byte `size` |
-| `ash_write` | `host`, `path`, `content` | Written byte `size` |
+| `ash_read` | `host`, `path`; optional `encoding` (`text`/`base64`) | `content` or `content_base64`, and byte `size` |
+| `ash_write` | `host`, `path`, `content` or `content_base64` | Written byte `size` |
 | `ash_stat` | `host`, `path` | `path`, `size`, `mode`, `is_dir`, `modified_at` |
+| `ash_list` | `host`, `path` | `entries`: direct children with `name`, `path`, `size`, `mode`, `modified_at`, `is_dir`, `symlink` |
+| `ash_mkdir` | `host`, `path` | `ok` |
+| `ash_rename` | `host`, `from`, `to` | `ok` |
+| `ash_remove` | `host`, `path` | `ok` (non-recursive) |
+| `ash_write_atomic` | `host`, `path`, `content` or `content_base64` | Written byte `size` |
+| `ash_download` | `host`, `path` | `entries`: bounded tree with `path`, `is_dir`, `mode`, `size`, `content_base64` |
+| `ash_upload` | `host`, `path`, `entries` | Written byte `size` |
 | `ash_shell_create` | `host`; optional `cwd` | `id`, `host`, `backend` |
 | `ash_shell_list` | `host` | `shells`: live ASH-owned shells |
 | `ash_shell_send` | `host`, `shell_id`, `input` | `sent` |
 | `ash_shell_read` | `host`, `shell_id` | `content`, `truncated` |
 | `ash_shell_close` | `host`, `shell_id` | `closed` |
 
-A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.
+A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. `ash_read` returns UTF-8 `content` by default and rejects invalid UTF-8; pass `encoding: "base64"` for binary files. `ash_write` and `ash_write_atomic` accept `content` or `content_base64`, but not both. Host listings omit identity paths and authentication internals.
 
 Capabilities grant access with the remote account's permissions. They do not constrain paths or commands: an enabled `exec` capability can itself read or modify files. Configure only hosts and accounts you intend the connected agent to operate.
 

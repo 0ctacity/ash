@@ -153,6 +153,55 @@ func TestOpenSSH(t *testing.T) {
 			t.Fatal(e)
 		}
 	})
+	t.Run("tree", func(t *testing.T) {
+		root := filepath.Join(dir, "tree")
+		os.MkdirAll(filepath.Join(root, "a", "b"), 0755)
+		os.WriteFile(filepath.Join(root, "a", "b", "c.txt"), []byte("deep"), 0644)
+		os.WriteFile(filepath.Join(root, "top.txt"), []byte("top"), 0644)
+		os.Symlink(filepath.Join(root, "top.txt"), filepath.Join(root, "link"))
+		entries, e := tr.List(context.Background(), h, root)
+		if e != nil || len(entries) < 3 || entries[0].Name != "a" {
+			t.Fatalf("list: %+v %v", entries, e)
+		}
+		if e = tr.Mkdir(context.Background(), h, filepath.Join(root, "new")); e != nil {
+			t.Fatal(e)
+		}
+		if e = tr.Mkdir(context.Background(), h, filepath.Join(root, "new", "child")); e == nil {
+			t.Fatal("mkdir created missing parents")
+		}
+		if e = tr.Rename(context.Background(), h, filepath.Join(root, "new"), filepath.Join(root, "moved")); e != nil {
+			t.Fatal(e)
+		}
+		if e = tr.Remove(context.Background(), h, filepath.Join(root, "moved")); e != nil {
+			t.Fatal(e)
+		}
+		target := filepath.Join(root, "atomic.txt")
+		if e = tr.Write(context.Background(), h, target, []byte("old")); e != nil {
+			t.Fatal(e)
+		}
+		if e = tr.AtomicWrite(context.Background(), h, target, []byte("new")); e != nil {
+			t.Fatal(e)
+		}
+		if data, e := tr.Read(context.Background(), h, target); e != nil || string(data) != "new" {
+			t.Fatalf("atomic %q %v", data, e)
+		}
+		tree, e := tr.ReadTree(context.Background(), h, root)
+		if e != nil {
+			t.Fatal(e)
+		}
+		for _, entry := range tree {
+			if strings.Contains(entry.Path, "link") {
+				t.Fatalf("followed symlink: %+v", entry)
+			}
+		}
+		upload := filepath.Join(dir, "upload")
+		if e = tr.WriteTree(context.Background(), h, upload, []transport.TreeEntry{{Path: "x", IsDir: true}, {Path: "x/y.txt", Data: []byte("hi")}}); e != nil {
+			t.Fatal(e)
+		}
+		if data, e := tr.Read(context.Background(), h, filepath.Join(upload, "x", "y.txt")); e != nil || string(data) != "hi" {
+			t.Fatalf("upload %q %v", data, e)
+		}
+	})
 	t.Run("timeout", func(t *testing.T) {
 		_, e := tr.Exec(context.Background(), h, transport.ExecRequest{Command: "sleep 10", Timeout: 100 * time.Millisecond})
 		if !errors.Is(e, transport.ErrTimeout) {
