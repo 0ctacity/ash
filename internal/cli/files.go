@@ -3,12 +3,15 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 
 	"ash/internal/service"
 	"ash/internal/transport"
@@ -44,6 +47,12 @@ func runWrite(ctx context.Context, args []string, s *service.Service, in io.Read
 
 // runDownload maps a bounded remote tree onto a local directory. It never
 // follows remote symlinks and refuses to write outside the local root.
+//
+// Lexical containment alone is not enough locally: MkdirAll and WriteFile
+// follow existing symlinks, so a pre-existing symlinked directory inside the
+// destination could redirect a tree entry outside the root. Every destination
+// component is therefore checked with Lstat and any existing symlink in the
+// path is refused.
 func runDownload(ctx context.Context, args []string, s *service.Service) error {
 	if len(args) != 3 {
 		return fmt.Errorf("download requires HOST REMOTE_DIR LOCAL_DIR")
@@ -60,19 +69,91 @@ func runDownload(ctx context.Context, args []string, s *service.Service) error {
 			return fmt.Errorf("refusing to write %q outside %q", entry.Path, root)
 		}
 		if entry.IsDir {
-			if err := os.MkdirAll(target, 0o755); err != nil {
+			if err := mkdirAllSafe(target, root); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if err := mkdirAllSafe(filepath.Dir(target), root); err != nil {
 			return err
 		}
-		if err := os.WriteFile(target, entry.Data, 0o644); err != nil {
+		file, err := openNewFile(target)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(entry.Data); err != nil {
+			file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// mkdirAllSafe creates dir and any missing parents, refusing to traverse an
+// existing symlink component. Components at or below root are verified; the
+// root itself is the caller's responsibility.
+func mkdirAllSafe(dir, root string) error {
+	if dir == root || dir == string(filepath.Separator) || dir == "." {
+		return ensureNotSymlink(dir)
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir {
+		if err := mkdirAllSafe(parent, root); err != nil {
+			return err
+		}
+	}
+	if err := ensureNotSymlink(dir); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	switch {
+	case err == nil && info.IsDir():
+		return nil
+	case err == nil:
+		return fmt.Errorf("%q exists and is not a directory", dir)
+	case !errors.Is(err, os.ErrNotExist):
+		return err
+	}
+	return os.Mkdir(dir, 0o755)
+}
+
+// ensureNotSymlink rejects a path whose final component is a symlink.
+func ensureNotSymlink(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to follow symlink %q", path)
+	}
+	return nil
+}
+
+// openNewFile opens target for writing without following a symlink placed at
+// the path (before or during the open). O_NOFOLLOW makes the kernel refuse
+// symlink finals atomically where available; the Windows branch relies on the
+// earlier Lstat walk plus os.OpenFile not creating symlink entries itself.
+func openNewFile(target string) (*os.File, error) {
+	if runtime.GOOS != "windows" {
+		file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+		if err != nil {
+			if errors.Is(err, syscall.ELOOP) {
+				return nil, fmt.Errorf("refusing to write through symlink %q", target)
+			}
+			return nil, err
+		}
+		return file, nil
+	}
+	if err := ensureNotSymlink(target); err != nil {
+		return nil, err
+	}
+	return os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 }
 
 // runUpload maps a local directory onto a bounded remote tree, skipping symlinks.
