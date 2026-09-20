@@ -16,6 +16,8 @@ import (
 const Usage = `Usage:
   ash --version
   ash [--config PATH] hosts
+  ash [--config PATH] host add NAME --address ADDRESS --user USER [--port N] [--identity PATH] [--exec] [--read] [--write]
+  ash [--config PATH] doctor [HOST] [--json]
   ash [--config PATH] exec HOST [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
   ash [--config PATH] read HOST PATH
   ash [--config PATH] write HOST PATH < FILE

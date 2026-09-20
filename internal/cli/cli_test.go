@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ash/internal/config"
+	"ash/internal/doctor"
 	"ash/internal/host"
 	"ash/internal/policy"
 	"ash/internal/service"
@@ -40,6 +43,43 @@ func TestExecRequiresDelimiter(t *testing.T) {
 	var out bytes.Buffer
 	if c := Run(context.Background(), []string{"exec", "h", "true"}, nil, nil, strings.NewReader(""), &out, &out); c != 1 {
 		t.Fatal(c)
+	}
+}
+
+func TestHostAddCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	var out, errout bytes.Buffer
+	if code := HostAdd([]string{"fedora", "--address", "10.0.0.1", "--user", "ata", "--exec"}, path, &out, &errout); code != 0 || !strings.Contains(out.String(), `"host":"fedora"`) {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	c, err := config.Load(path)
+	if err != nil || !c.Hosts["fedora"].Policy.Exec || c.Hosts["fedora"].User != "ata" {
+		t.Fatalf("%v %+v", err, c.Hosts)
+	}
+	if code := HostAdd([]string{"bad", "--user", "u"}, path, &out, &errout); code != 1 {
+		t.Fatal("missing address accepted")
+	}
+}
+
+type doctorTransport struct{ transport.Transport }
+
+func (doctorTransport) Exec(context.Context, host.Host, transport.ExecRequest) (transport.ExecResult, error) {
+	return transport.ExecResult{}, nil
+}
+
+func TestDoctorCommandTextAndJSON(t *testing.T) {
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	d := doctor.New(host.New(map[string]host.Host{"h": {Address: "a", Port: 22, User: "u", Policy: policy.Policy{Exec: true}}}), doctorTransport{}, known)
+	var out, errout bytes.Buffer
+	if code := Doctor(context.Background(), []string{"h"}, d, &out, &errout); code != 0 || !strings.Contains(out.String(), "trust") || !strings.Contains(out.String(), "host key verified") {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	out.Reset()
+	if code := Doctor(context.Background(), []string{"h", "--json"}, d, &out, &errout); code != 0 || !strings.HasPrefix(strings.TrimSpace(out.String()), "{") {
+		t.Fatalf("%d %q", code, out.String())
+	}
+	if code := Doctor(context.Background(), []string{"missing"}, d, &out, &errout); code != 1 {
+		t.Fatal("unknown host should fail")
 	}
 }
 
