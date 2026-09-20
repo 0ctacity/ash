@@ -108,7 +108,7 @@ printf 'pwd\n' | ./ash shell send fedora "$SHELL_ID"
 
 `send` accepts an optional literal INPUT argument, or reads stdin when omitted. It adds no newline: include one to submit a command. It returns after delivering input, without waiting for the shell command to finish. Input is UTF-8 without NUL and is limited to 64 KiB.
 
-`read` returns a snapshot of rendered terminal text and available scrollback, with stdout and stderr merged. Repeated reads can repeat output. Snapshots are bounded by the existing 8 MiB transport limit and report truncation. This is a polling interface, with no incremental cursor, streaming, full-screen TUI support, or per-command exit status. Use one-shot `exec` when you need a structured command result.
+`read` returns rendered terminal text and available scrollback, with stdout and stderr merged. Without a cursor it returns a full snapshot (and may repeat previous output). `--json` includes an opaque `cursor`; pass `--cursor VALUE` on the next read to receive only output added since the snapshot that produced it. A cursor is a byte-delta optimization over append-like output, not a terminal event log: if the pane changed, scrollback was truncated, or a redraw altered earlier bytes, the read returns a full snapshot with `resync: true` and a fresh cursor. Expired or malformed cursors resynchronize rather than fail. Snapshots are bounded by the existing 8 MiB transport limit and report truncation. This is a polling interface, with no streaming or full-screen TUI support and no per-command exit status. Use one-shot `exec` when you need a structured command result.
 
 Every shell operation requires the host's existing `exec` capability. No additional policy flag is introduced. ASH-generated IDs map to reserved remote session names; ASH lists and controls only sessions in that namespace. Liveness is queried from Zellij, with no local session metadata to become stale. Exited sessions are not listed. Closing a shell is idempotent and also removes its ASH-owned backend configuration after an external termination. The namespace is organizational ownership, not isolation from other processes running as the same remote account. Zellij startup settings live in the remote `~/.cache/ash/shells/ID/config.kdl` until the shell is closed; this file is configuration, not a liveness record.
 
@@ -141,7 +141,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | `ash_shell_create` | `host`; optional `cwd` | `id`, `host`, `backend` |
 | `ash_shell_list` | `host` | `shells`: live ASH-owned shells |
 | `ash_shell_send` | `host`, `shell_id`, `input` | `sent` |
-| `ash_shell_read` | `host`, `shell_id` | `content`, `truncated` |
+| `ash_shell_read` | `host`, `shell_id`; optional `cursor` | `content`, `cursor`, `truncated`, `resync` |
 | `ash_shell_close` | `host`, `shell_id` | `closed` |
 
 A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.

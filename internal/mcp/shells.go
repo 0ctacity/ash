@@ -18,6 +18,7 @@ type shellHostInput struct {
 type shellInput struct {
 	Host    string `json:"host"`
 	ShellID string `json:"shell_id"`
+	Cursor  string `json:"cursor,omitempty" jsonschema:"Opaque cursor from a previous read. When set, only output added since that read is returned."`
 }
 type shellSendInput struct {
 	Host    string `json:"host"`
@@ -47,8 +48,8 @@ func registerShellTools(server *sdk.Server, s *service.ShellService) {
 		err := s.Send(ctx, in.Host, in.ShellID, in.Input)
 		return nil, shellSendOutput{Sent: err == nil}, err
 	})
-	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_read", Description: "Read a bounded snapshot of shell terminal output and available scrollback. Includes merged stdout/stderr and may repeat previous output. Requires exec capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellInput) (*sdk.CallToolResult, shell.Output, error) {
-		output, err := s.Read(ctx, in.Host, in.ShellID)
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_read", Description: "Read shell terminal output. Without cursor, returns a bounded snapshot of output and available scrollback. With cursor, returns only output added since that read, or a full snapshot with resync=true. Includes merged stdout/stderr. Requires exec capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellInput) (*sdk.CallToolResult, shell.Output, error) {
+		output, err := s.Read(ctx, in.Host, in.ShellID, in.Cursor)
 		return nil, output, err
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_shell_close", Description: "Close one ASH-owned persistent shell and clean up its backend session. Requires exec capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in shellInput) (*sdk.CallToolResult, shellCloseOutput, error) {

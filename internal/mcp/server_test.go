@@ -95,7 +95,7 @@ func TestClientCancellationReachesService(t *testing.T) {
 
 type persistentBackend struct {
 	shell.Backend
-	id, input string
+	id, input, cursor string
 }
 
 func (b *persistentBackend) Name() string { return "test" }
@@ -113,8 +113,9 @@ func (b *persistentBackend) Send(_ context.Context, _ host.Host, id, input strin
 	b.input = input
 	return nil
 }
-func (b *persistentBackend) Read(context.Context, host.Host, string) (shell.Output, error) {
-	return shell.Output{Content: b.input}, nil
+func (b *persistentBackend) Read(_ context.Context, _ host.Host, _ string, req shell.ReadRequest) (shell.Output, error) {
+	b.cursor = req.Cursor
+	return shell.Output{Content: b.input, Cursor: "next"}, nil
 }
 func (b *persistentBackend) Close(context.Context, host.Host, string) error { b.id = ""; return nil }
 

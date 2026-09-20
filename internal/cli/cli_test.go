@@ -65,7 +65,7 @@ func TestWriteCancellationInterruptsStdin(t *testing.T) {
 
 type shellRecorder struct {
 	shell.Backend
-	input, cwd, id string
+	input, cwd, id, cursor string
 }
 
 func (r *shellRecorder) Name() string { return "test" }
@@ -103,8 +103,9 @@ func (r *shellRecorder) List(context.Context, host.Host) ([]string, error) {
 	}
 	return []string{r.id}, nil
 }
-func (r *shellRecorder) Read(context.Context, host.Host, string) (shell.Output, error) {
-	return shell.Output{Content: r.input, Truncated: true}, nil
+func (r *shellRecorder) Read(_ context.Context, _ host.Host, _ string, req shell.ReadRequest) (shell.Output, error) {
+	r.cursor = req.Cursor
+	return shell.Output{Content: r.input, Cursor: "next-cursor", Truncated: true}, nil
 }
 func (r *shellRecorder) Close(context.Context, host.Host, string) error { r.id = ""; return nil }
 func TestShellCLIListReadCloseAndInputLimit(t *testing.T) {
@@ -121,6 +122,9 @@ func TestShellCLIListReadCloseAndInputLimit(t *testing.T) {
 		t.Fatalf("%d %q %q", code, out.String(), errout.String())
 	}
 	if code := run("shell", "read", "h", id); code != 0 || out.String() != "captured output" || !strings.Contains(errout.String(), "truncated") {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	if code := run("shell", "read", "h", id, "--cursor", "abc", "--json"); code != 0 || r.cursor != "abc" || !strings.Contains(out.String(), `"cursor":"next-cursor"`) {
 		t.Fatalf("%d %q %q", code, out.String(), errout.String())
 	}
 	if code := Run(context.Background(), []string{"shell", "send", "h", id}, nil, shells, strings.NewReader(strings.Repeat("a", shell.MaxInputSize+1)), &out, &errout); code != 1 || r.input != "captured output" {

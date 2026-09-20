@@ -102,7 +102,7 @@ func (s *ShellService) Send(ctx context.Context, name, id, input string) error {
 	return operationError(ctx, name, "shell send", s.backend.Send(ctx, h, id, input))
 }
 
-func (s *ShellService) Read(ctx context.Context, name, id string) (shell.Output, error) {
+func (s *ShellService) Read(ctx context.Context, name, id, cursor string) (shell.Output, error) {
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.Output{}, err
@@ -110,9 +110,12 @@ func (s *ShellService) Read(ctx context.Context, name, id string) (shell.Output,
 	if err = shell.ValidateID(id); err != nil {
 		return shell.Output{}, err
 	}
+	if len(cursor) > shell.MaxCursorSize {
+		return shell.Output{}, fmt.Errorf("shell cursor exceeds %d byte limit", shell.MaxCursorSize)
+	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	output, err := s.backend.Read(ctx, h, id)
+	output, err := s.backend.Read(ctx, h, id, shell.ReadRequest{Cursor: cursor})
 	return output, operationError(ctx, name, "shell read", err)
 }
 
