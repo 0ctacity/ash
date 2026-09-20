@@ -16,7 +16,14 @@ type Host struct {
 	Port     int           `toml:"port"`
 	User     string        `toml:"user"`
 	Identity string        `toml:"identity"`
+	SSHAlias string        `toml:"ssh_alias"`
 	Policy   policy.Policy `toml:"policy"`
+
+	// Resolved from an OpenSSH alias at startup. They are never exposed through
+	// `ash hosts` and are not part of the configuration file.
+	Identities   []string `toml:"-"`
+	AgentSocket  string   `toml:"-"`
+	HostKeyAlias string   `toml:"-"`
 }
 
 type Registry struct{ hosts map[string]Host }

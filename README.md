@@ -62,7 +62,23 @@ ASH verifies the configured address and port against `~/.ssh/known_hosts`. Estab
 ssh ata@100.64.1.20
 ```
 
-Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH aliases, `ProxyJump`, or other `~/.ssh/config` settings. Listing hosts and starting MCP do not require a connection or a known-hosts file; remote operations require a trusted host key.
+Use `ssh -p PORT USER@ADDRESS` for a custom port. Listing hosts and starting MCP do not require a connection or a known-hosts file; remote operations require a trusted host key.
+
+### Reuse an OpenSSH alias
+
+An ASH host may reference an OpenSSH alias instead of duplicating connection details:
+
+```toml
+[hosts.fedora]
+ssh_alias = "fedora"
+
+[hosts.fedora.policy]
+exec = true
+read = true
+write = true
+```
+
+ASH resolves the alias once at startup by running the installed OpenSSH client (`ssh -G -- ALIAS`), so aliases, `Include`, and `Match` behave exactly as OpenSSH does. Precedence is explicit ASH value, then the resolved OpenSSH value, then the ASH default; the ASH host name stays separate from the resolved address. Resolved fields include hostname, user, port, identity files (loaded in order), `IdentityAgent`, and `HostKeyAlias`. ASH deliberately rejects an alias that uses `ProxyJump`, `ProxyCommand`, `CertificateFile`, or `PKCS11Provider`, naming the directive before any network access, rather than emulating it partially. Hosts without `ssh_alias` keep the pure-Go behavior and never invoke OpenSSH.
 
 ### Restrict a host
 

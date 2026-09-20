@@ -25,13 +25,23 @@ func Parse(data []byte) (Config, error) {
 		return c, fmt.Errorf("parse config: %w", err)
 	}
 	for name, h := range c.Hosts {
-		if strings.TrimSpace(name) == "" || strings.TrimSpace(h.Address) == "" || strings.TrimSpace(h.User) == "" {
-			return c, fmt.Errorf("host %q requires a name, address and user", name)
+		if strings.TrimSpace(name) == "" {
+			return c, fmt.Errorf("host %q requires a name", name)
 		}
-		if h.Port == 0 {
+		alias := strings.TrimSpace(h.SSHAlias)
+		if strings.ContainsRune(h.SSHAlias, 0) {
+			return c, fmt.Errorf("host %q: ssh_alias must not contain NUL", name)
+		}
+		if alias == "" && strings.TrimSpace(h.Address) == "" {
+			return c, fmt.Errorf("host %q requires an address or an ssh_alias", name)
+		}
+		if alias == "" && strings.TrimSpace(h.User) == "" {
+			return c, fmt.Errorf("host %q requires a user or an ssh_alias", name)
+		}
+		if h.Port == 0 && alias == "" {
 			h.Port = 22
 		}
-		if h.Port < 1 || h.Port > 65535 {
+		if h.Port != 0 && (h.Port < 1 || h.Port > 65535) {
 			return c, fmt.Errorf("host %q: invalid port %d", name, h.Port)
 		}
 		if err := h.Policy.Validate(); err != nil {
