@@ -23,6 +23,22 @@ type Transport struct{ knownHostsPath string }
 func New(knownHostsPath string) (*Transport, error) {
 	return &Transport{knownHostsPath: knownHostsPath}, nil
 }
+
+// expandHome resolves a leading ~/ against the local home directory.
+func expandHome(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
+}
+
 func (t *Transport) knownHosts() (gossh.HostKeyCallback, error) {
 	callback, err := knownhosts.New(t.knownHostsPath)
 	if err != nil {
@@ -63,8 +79,14 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 		}
 	}
 	var allSigners []gossh.Signer
-	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	// An explicit OpenSSH IdentityAgent (including "none") overrides the
+	// environment; otherwise use SSH_AUTH_SOCK.
+	agentSocket := h.AgentSocket
+	if agentSocket == "" {
+		agentSocket = os.Getenv("SSH_AUTH_SOCK")
+	}
+	if agentSocket != "" && agentSocket != "none" {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", agentSocket)
 		if err == nil {
 			agentConn = conn
 			stopAgent = context.AfterFunc(ctx, func() { conn.Close() })
@@ -74,17 +96,17 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 			}
 		}
 	}
-	if h.Identity != "" {
-		identity := h.Identity
-		if strings.HasPrefix(identity, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				cleanupAgent()
-				return nil, nil, err
-			}
-			identity = filepath.Join(home, identity[2:])
+	identities := h.Identities
+	if len(identities) == 0 && h.Identity != "" {
+		identities = []string{h.Identity}
+	}
+	for _, identity := range identities {
+		path, err := expandHome(identity)
+		if err != nil {
+			cleanupAgent()
+			return nil, nil, err
 		}
-		key, err := os.ReadFile(identity)
+		key, err := os.ReadFile(path)
 		if err != nil {
 			cleanupAgent()
 			return nil, nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
@@ -108,16 +130,21 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 	if port == 0 {
 		port = 22
 	}
-	address := net.JoinHostPort(h.Address, strconv.Itoa(port))
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	dialAddress := net.JoinHostPort(h.Address, strconv.Itoa(port))
+	// HostKeyAlias changes only host-key lookup, not the dialed address.
+	verifyAddress := dialAddress
+	if h.HostKeyAlias != "" {
+		verifyAddress = net.JoinHostPort(h.HostKeyAlias, strconv.Itoa(port))
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", dialAddress)
 	if err != nil {
 		cleanupAgent()
 		return nil, nil, operationError(ctx, fmt.Errorf("connect to host %q: %w", h.Name, err))
 	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	cleanup := func() { stop(); conn.Close(); cleanupAgent() }
-	algorithms := preferredHostKeyAlgorithms(hostKey, address, conn.RemoteAddr())
-	sshConn, chans, reqs, err := gossh.NewClientConn(conn, address, &gossh.ClientConfig{User: h.User, Auth: []gossh.AuthMethod{gossh.PublicKeys(allSigners...)}, HostKeyCallback: hostKey, HostKeyAlgorithms: algorithms})
+	algorithms := preferredHostKeyAlgorithms(hostKey, verifyAddress, conn.RemoteAddr())
+	sshConn, chans, reqs, err := gossh.NewClientConn(conn, verifyAddress, &gossh.ClientConfig{User: h.User, Auth: []gossh.AuthMethod{gossh.PublicKeys(allSigners...)}, HostKeyCallback: hostKey, HostKeyAlgorithms: algorithms})
 	if err != nil {
 		cleanup()
 		err = operationError(ctx, err)

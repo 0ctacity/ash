@@ -17,6 +17,7 @@ import (
 	ashmcp "ash/internal/mcp"
 	"ash/internal/service"
 	"ash/internal/shell/zellij"
+	"ash/internal/sshconfig"
 	sshtransport "ash/internal/transport/ssh"
 )
 
@@ -48,6 +49,18 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	c, err := config.Load(path)
 	if err != nil {
 		return fail(err)
+	}
+	// Resolve OpenSSH aliases once before building the host registry. Hosts
+	// without ssh_alias keep the pure-Go behavior and never invoke OpenSSH.
+	for name, h := range c.Hosts {
+		if h.SSHAlias == "" {
+			continue
+		}
+		effective, err := sshconfig.Resolve(ctx, h.SSHAlias)
+		if err != nil {
+			return fail(fmt.Errorf("host %q: %w", name, err))
+		}
+		c.Hosts[name] = effective.Apply(h)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {

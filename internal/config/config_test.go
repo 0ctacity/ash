@@ -17,3 +17,19 @@ func TestParseDefaultsAndValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSSHAliasHosts(t *testing.T) {
+	c, err := Parse([]byte("[hosts.a]\nssh_alias='fedora'\n[hosts.a.policy]\nexec=true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := c.Hosts["a"]
+	if h.SSHAlias != "fedora" || h.Address != "" || h.User != "" || h.Port != 0 || !h.Policy.Exec {
+		t.Fatalf("%+v", h)
+	}
+	// An alias may coexist with explicit overrides; port stays unset so the
+	// resolved OpenSSH value can apply.
+	if c, err = Parse([]byte("[hosts.b]\nssh_alias='x'\naddress='1.2.3.4'\nuser='u'\n")); err != nil || c.Hosts["b"].Port != 0 {
+		t.Fatalf("%v %+v", err, c.Hosts["b"])
+	}
+}
