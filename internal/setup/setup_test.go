@@ -1,6 +1,7 @@
 package setup
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,7 +120,12 @@ func TestOpenCodeSetupPreservesOtherKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"theme": "dark"`, `"existing"`, `"ash"`, `"type": "local"`, `"enabled": true`, `https://opencode.ai/config.json`, `"` + opts.AshPath + `"`} {
+	// JSON escapes path separators, so compare against the marshaled form.
+	ashJSON, err := json.Marshal(opts.AshPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"theme": "dark"`, `"existing"`, `"ash"`, `"type": "local"`, `"enabled": true`, `https://opencode.ai/config.json`, string(ashJSON)} {
 		if !strings.Contains(result.Content, want) {
 			t.Fatalf("missing %q in:\n%s", want, result.Content)
 		}
