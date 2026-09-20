@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -16,8 +17,11 @@ func TestRecorderPermissionsAndAppends(t *testing.T) {
 		t.Fatal(err)
 	}
 	info, err := os.Stat(path)
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("mode %v %v", info, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode %v", info.Mode())
 	}
 	recorder.Record(Record{Operation: "exec", Host: "h", Decision: Allowed, Result: ResultOK})
 	recorder.Record(Record{Operation: "read", Host: "h", Decision: Denied, Result: ResultError})
