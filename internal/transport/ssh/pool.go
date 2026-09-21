@@ -16,6 +16,10 @@ const (
 	DefaultMaxConnections = 64
 	DefaultMaxIdlePerHost = 4
 	DefaultIdleLifetime   = 30 * time.Second
+	// DefaultHealthCheckTimeout bounds each liveness probe of a pooled
+	// connection. A half-open connection must never stall a caller longer
+	// than this, even without caller cancellation.
+	DefaultHealthCheckTimeout = 3 * time.Second
 )
 
 // connKey identifies connections that may be reused. Any difference in host,
@@ -32,10 +36,11 @@ type connKey struct {
 	knownHosts   string
 }
 
-// resource is a pooled connection. alive reports whether the remote end is
-// still responsive; close releases it.
+// resource is a pooled connection. healthCheck reports whether the remote end
+// is still responsive; it must respect the given context, which always carries
+// a deadline. close releases the resource and must run exactly once.
 type resource interface {
-	alive() bool
+	healthCheck(ctx context.Context) bool
 	close() error
 }
 
@@ -60,14 +65,19 @@ type idleResource struct {
 // resourcePool reuses live connections within a connKey boundary. It bounds
 // total open connections (blocking new dials when full, evicting idle ones
 // first) and per-key idle connections, and expires idle connections.
+//
+// Lock discipline: the mutex guards bookkeeping only. Liveness probes and
+// resource closes always run outside it, so a stalled network operation on
+// one connection can never block other keys, puts, evictions, or Close.
 type resourcePool struct {
-	mu      sync.Mutex
-	idle    map[connKey][]idleResource
-	slots   chan struct{}
-	maxIdle int
-	ttl     time.Duration
-	now     func() time.Time
-	closed  bool
+	mu            sync.Mutex
+	idle          map[connKey][]idleResource
+	slots         chan struct{}
+	maxIdle       int
+	ttl           time.Duration
+	healthTimeout time.Duration
+	now           func() time.Time
+	closed        bool
 }
 
 func newResourcePool(maxConnections, maxIdle int, ttl time.Duration, now func() time.Time) *resourcePool {
@@ -80,7 +90,14 @@ func newResourcePool(maxConnections, maxIdle int, ttl time.Duration, now func() 
 	if now == nil {
 		now = time.Now
 	}
-	return &resourcePool{idle: make(map[connKey][]idleResource), slots: make(chan struct{}, maxConnections), maxIdle: maxIdle, ttl: ttl, now: now}
+	return &resourcePool{
+		idle:          make(map[connKey][]idleResource),
+		slots:         make(chan struct{}, maxConnections),
+		maxIdle:       maxIdle,
+		ttl:           ttl,
+		healthTimeout: DefaultHealthCheckTimeout,
+		now:           now,
+	}
 }
 
 // reserve acquires one connection slot, evicting an idle connection or waiting.
@@ -106,23 +123,63 @@ func (p *resourcePool) reserve(ctx context.Context) error {
 }
 
 // get returns a live, unexpired idle resource for the key, if any.
-func (p *resourcePool) get(key connKey) (resource, bool) {
+//
+// A candidate is claimed under the lock and probed outside it: the probe runs
+// with the caller's context (cancellation honored) plus a short pool-level
+// deadline. A timed-out or failed connection is closed and its slot released
+// exactly once, and the next candidate is tried.
+func (p *resourcePool) get(ctx context.Context, key connKey) (resource, bool) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, false
+		}
+		res, expired, ok := p.claimIdle(key)
+		p.closeAll(expired)
+		if !ok {
+			return nil, false
+		}
+		if p.healthCheck(ctx, res) {
+			return res, true
+		}
+		p.closeReleasingSlot(res)
+	}
+}
+
+// claimIdle pops the newest candidate for the key under the lock, returning
+// the candidates that expired while pooled (to be closed by the caller) and
+// whether a live candidate was found. Expired resources are not closed here:
+// closing happens without the mutex.
+func (p *resourcePool) claimIdle(key connKey) (res resource, expired []resource, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	list := p.idle[key]
 	for len(list) > 0 {
 		last := list[len(list)-1]
 		list = list[:len(list)-1]
-		if p.now().Sub(last.since) > p.ttl || !last.res.alive() {
-			_ = last.res.close()
-			p.releaseSlot()
+		if p.now().Sub(last.since) > p.ttl {
+			expired = append(expired, last.res)
 			continue
 		}
 		p.idle[key] = list
-		return last.res, true
+		return last.res, expired, true
 	}
 	p.idle[key] = list
-	return nil, false
+	return nil, expired, false
+}
+
+// healthCheck probes one claimed resource with the caller's context bounded by
+// the pool's explicit health-check timeout. The pool mutex is never held here.
+func (p *resourcePool) healthCheck(ctx context.Context, res resource) bool {
+	checkCtx, cancel := context.WithTimeout(ctx, p.healthTimeout)
+	defer cancel()
+	return res.healthCheck(checkCtx)
+}
+
+// closeAll closes resources and releases their slots, without the mutex held.
+func (p *resourcePool) closeAll(resources []resource) {
+	for _, res := range resources {
+		p.closeReleasingSlot(res)
+	}
 }
 
 // put returns a connection to the idle set, or closes it when the per-key idle
@@ -149,6 +206,9 @@ func (p *resourcePool) discard(res resource) {
 	p.closeReleasingSlot(res)
 }
 
+// closeReleasingSlot closes the resource and releases its slot exactly once.
+// It must be called without the pool mutex held: closing can interact with
+// the network, and the whole point is that no caller waits on the mutex for it.
 func (p *resourcePool) closeReleasingSlot(res resource) {
 	_ = res.close()
 	p.releaseSlot()
@@ -161,9 +221,12 @@ func (p *resourcePool) releaseSlot() {
 	}
 }
 
+// evictOldestIdle removes and closes the longest-pooled idle connection to
+// free a slot for the caller. The victim is chosen and removed under the lock
+// and closed outside it, so eviction never blocks the pool on a close; the
+// synchronous close still guarantees the slot is free when reserve retries.
 func (p *resourcePool) evictOldestIdle() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	var oldestKey connKey
 	oldestIndex := -1
 	var oldest time.Time
@@ -175,6 +238,7 @@ func (p *resourcePool) evictOldestIdle() {
 		}
 	}
 	if oldestIndex < 0 {
+		p.mu.Unlock()
 		return
 	}
 	list := p.idle[oldestKey]
@@ -185,11 +249,14 @@ func (p *resourcePool) evictOldestIdle() {
 	} else {
 		p.idle[oldestKey] = list
 	}
-	_ = victim.res.close()
-	p.releaseSlot()
+	p.mu.Unlock()
+	p.closeReleasingSlot(victim.res)
 }
 
 // Close closes every idle connection and marks the pool shutting down.
+// Connections currently claimed by a health check or an active operation are
+// not waited on: their owners close them, so Close never blocks behind a
+// stalled network probe.
 func (p *resourcePool) Close() {
 	p.mu.Lock()
 	if p.closed {
@@ -202,8 +269,7 @@ func (p *resourcePool) Close() {
 	p.mu.Unlock()
 	for _, list := range idle {
 		for _, item := range list {
-			_ = item.res.close()
-			p.releaseSlot()
+			p.closeReleasingSlot(item.res)
 		}
 	}
 }

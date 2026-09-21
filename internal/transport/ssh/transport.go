@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Transport struct {
@@ -60,27 +61,63 @@ func keyFor(h host.Host, knownHostsPath string) connKey {
 	}
 }
 
-// sshResource adapts a pooled SSH client to the pool's resource contract.
+// sshResource adapts a pooled SSH client to the pool's resource contract. It
+// owns the connection and the per-dial lifecycle (agent socket and context
+// stop); close releases both exactly once.
 type sshResource struct {
 	client    *gossh.Client
 	lifecycle resourceLifecycle
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func (r *sshResource) alive() bool {
+// healthCheck sends one keepalive probe. The provided context always carries a
+// deadline set by the pool, and this probe honors it: gossh.SendRequest blocks
+// on the connection, so the probe is aborted by closing the connection when
+// the deadline or the caller's cancellation fires first.
+func (r *sshResource) healthCheck(ctx context.Context) bool {
 	if r.client == nil {
 		return false
 	}
-	_, _, err := r.client.SendRequest("keepalive@openssh.com", true, nil)
-	return err == nil
+	type probeResult struct {
+		err error
+	}
+	probe := make(chan probeResult, 1)
+	go func() {
+		_, _, err := r.client.SendRequest("keepalive@openssh.com", true, nil)
+		probe <- probeResult{err: err}
+	}()
+	select {
+	case result := <-probe:
+		return result.err == nil
+	case <-ctx.Done():
+		// Bound the probe: a half-open connection would otherwise block
+		// forever. Closing the connection unblocks the in-flight request.
+		_ = r.client.Close()
+		return false
+	}
 }
 
 func (r *sshResource) setLifecycle(lc resourceLifecycle) { r.lifecycle = lc }
 
+// close tears down the connection and its per-dial lifecycle exactly once,
+// even when called from several eviction paths or after a failed health
+// check already closed the underlying connection. The lifecycle stop runs
+// before cleanup so the context watcher is released before its socket closes.
 func (r *sshResource) close() error {
-	if r.client == nil {
-		return nil
-	}
-	return r.client.Close()
+	r.closeOnce.Do(func() {
+		if r.lifecycle.stop != nil {
+			r.lifecycle.stop()
+		}
+		if r.client != nil {
+			r.closeErr = r.client.Close()
+		}
+		if r.lifecycle.cleanup != nil {
+			r.lifecycle.cleanup()
+		}
+		r.lifecycle = resourceLifecycle{}
+	})
+	return r.closeErr
 }
 
 // errIdentityMissing reports an identity file that does not exist and is
@@ -157,13 +194,14 @@ func expandHome(path string) (string, error) {
 // connect returns a pooled or freshly dialed client. The returned release
 // function returns the connection to the pool for reuse; it never closes a
 // healthy connection. Connection lifetime is intentionally independent of the
-// per-operation context.
+// per-operation context. The health check of a pooled candidate runs with the
+// caller's context, bounded by the pool's timeout, outside the pool mutex.
 func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, operationError(ctx, err)
 	}
 	key := keyFor(h, t.knownHostsPath)
-	if res, ok := t.pool.get(key); ok {
+	if res, ok := t.pool.get(ctx, key); ok {
 		return res.(*sshResource).client, func() { t.pool.put(key, res) }, nil
 	}
 	if err := t.pool.reserve(ctx); err != nil {
@@ -282,8 +320,11 @@ func (t *Transport) dialSSH(ctx context.Context, h host.Host) (*sshResource, err
 	stopHandshake()
 	client := gossh.NewClient(sshConn, chans, reqs)
 	// The per-dial resources (agent socket) belong to the long-lived
-	// connection and are released exactly once when it is finally closed.
-	return &sshResource{client: client}, nil
+	// connection and are released exactly once when it is finally closed
+	// through sshResource.close, from any eviction or shutdown path.
+	res := &sshResource{client: client}
+	res.setLifecycle(resourceLifecycle{stop: stopAgent, cleanup: cleanupAgent})
+	return res, nil
 }
 
 // preferredHostKeyAlgorithms asks the known_hosts matcher for this host's keys
