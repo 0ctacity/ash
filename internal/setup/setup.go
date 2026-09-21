@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
@@ -297,80 +298,259 @@ func tomlHasAshServer(existing []byte) (bool, error) {
 	return ok, nil
 }
 
-// upsertTOMLSection replaces the table whose header is exactly `header`, or
-// appends it. When `present` is true (an existing ASH table under any key
-// spelling), a duplicate append is skipped only when the literal header is
-// absent - meaning the table exists solely in quoted form, which must be
-// rewritten in place, not duplicated. It preserves every other line of the
-// document, including comments.
+// upsertTOMLSection replaces the existing ASH table - whatever valid header
+// spelling it uses - with the canonical section, or appends it. Only the
+// lines of that table are replaced, so unrelated bytes, comments, ordering,
+// and formatting survive untouched.
 func upsertTOMLSection(doc, header, section string, present bool) (string, error) {
 	doc = strings.TrimRight(doc, "\n")
 	lines := strings.Split(doc, "\n")
 	sectionLines := strings.Split(strings.TrimRight(section, "\n"), "\n")
-	start := -1
-	for i, line := range lines {
-		if strings.TrimSpace(line) == header {
-			start = i
-			break
-		}
+	key, _, ok := parseTableHeader(header)
+	if !ok {
+		return "", fmt.Errorf("internal: unsupported canonical header %q", header)
 	}
-	if start == -1 && present {
-		// The ASH table exists only under a quoted spelling. Rewriting it in
-		// place would require splicing into an arbitrary position; the safe,
-		// lossless move is to canonicalize through a full parse so the result
-		// has exactly one definition.
-		return rewriteTOMLCanonical(doc, section)
-	}
-	var out []string
-	if start == -1 {
-		if strings.TrimSpace(doc) != "" {
-			out = append(out, lines...)
-			out = append(out, "")
-		}
-		out = append(out, sectionLines...)
-	} else {
-		end := len(lines)
-		for i := start + 1; i < len(lines); i++ {
-			if strings.HasPrefix(strings.TrimSpace(lines[i]), "[") {
-				end = i
-				break
-			}
-		}
+	start, end := findTOMLTable(lines, key...)
+	if start != -1 {
+		out := make([]string, 0, len(lines)-(end-start)+len(sectionLines))
 		out = append(out, lines[:start]...)
 		out = append(out, sectionLines...)
 		out = append(out, lines[end:]...)
+		return strings.Join(out, "\n") + "\n", nil
 	}
+	if present {
+		// Semantically present but not a splicable table: dotted keys, an
+		// inline table, or an array of tables. Rewriting those in place would
+		// mean re-marshalling the document; refuse instead.
+		return "", fmt.Errorf("mcp_servers.ash exists in a form that cannot be updated in place (dotted keys, inline table, or array of tables); rewrite it as a [mcp_servers.\"ash\"] table and retry")
+	}
+	var out []string
+	if strings.TrimSpace(doc) != "" {
+		out = append(out, lines...)
+		out = append(out, "")
+	}
+	out = append(out, sectionLines...)
 	return strings.Join(out, "\n") + "\n", nil
 }
 
-// rewriteTOMLCanonical re-renders the whole document with mcp_servers.ash
-// replaced by the canonical section. This is the fallback when the ASH table
-// exists only under a quoted key spelling that textual splicing cannot find:
-// the result is semantically identical with exactly one ASH definition, at
-// the cost of comment placement inside the document.
-func rewriteTOMLCanonical(doc, section string) (string, error) {
-	var root map[string]any
-	if err := toml.Unmarshal([]byte(doc), &root); err != nil {
-		return "", fmt.Errorf("parse existing config: %w", err)
+// rewriteTOMLSectionInPlace was removed: upsertTOMLSection splices the
+// canonical section over exactly the existing table's lines, whatever valid
+// header spelling it uses, so nothing is ever re-marshalled.
+
+// findTOMLTable locates the [start, end) line range of the single table
+// definition whose dotted key equals want. Lines inside multi-line strings or
+// still-open arrays are never treated as table headers.
+func findTOMLTable(lines []string, want ...string) (int, int) {
+	state := &tomlLineState{}
+	for i, line := range lines {
+		key, header, single := state.scan(line)
+		if !header {
+			continue
+		}
+		if equalKey(key, want) && single {
+			return i, tableEnd(lines, i)
+		}
 	}
-	var ashSection map[string]any
-	if err := toml.Unmarshal([]byte(section), &ashSection); err != nil {
-		return "", err
+	return -1, -1
+}
+
+// tableEnd returns the exclusive end line of the table starting at start: the
+// next top-level table header, or the end of the document. Blank and
+// comment-only lines directly before the next header belong to neither table
+// and stay outside the replaced range.
+func tableEnd(lines []string, start int) int {
+	state := &tomlLineState{}
+	end := len(lines)
+	for i := start + 1; i < len(lines); i++ {
+		if _, header, _ := state.scan(lines[i]); header {
+			end = i
+			break
+		}
 	}
-	servers, _ := root["mcp_servers"].(map[string]any)
-	if servers == nil {
-		servers = map[string]any{}
+	for end > start+1 && isBlankOrComment(lines[end-1]) {
+		end--
 	}
-	ash, _ := ashSection["mcp_servers"].(map[string]any)
-	if entry, ok := ash["ash"]; ok {
-		servers["ash"] = entry
+	return end
+}
+
+func isBlankOrComment(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return trimmed == "" || strings.HasPrefix(trimmed, "#")
+}
+
+func equalKey(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	root["mcp_servers"] = servers
-	out, err := toml.Marshal(root)
-	if err != nil {
-		return "", err
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
-	return string(out), nil
+	return true
+}
+
+// tomlLineState tracks what a line-oriented view of TOML cannot see on its
+// own: whether a multi-line string or an unclosed array is still open.
+type tomlLineState struct {
+	depth     int
+	multiline int // 0 none, 1 basic """ string, 2 literal ''' string
+}
+
+// scan processes one line. When the line opens a new table at top level it
+// reports the parsed dotted key, whether it is a table header, and whether it
+// is a single table (false means an array-of-tables header).
+func (s *tomlLineState) scan(line string) (key []string, header bool, single bool) {
+	if s.depth == 0 && s.multiline == 0 {
+		if key, aot, ok := parseTableHeader(line); ok {
+			return key, true, !aot
+		}
+	}
+	s.consume(line)
+	return nil, false, false
+}
+
+// consume feeds one non-header line into the open-construct state.
+func (s *tomlLineState) consume(line string) {
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case s.multiline == 1:
+			if c == '\\' {
+				i++
+			} else if strings.HasPrefix(line[i:], `"""`) {
+				s.multiline = 0
+				i += 2
+			}
+		case s.multiline == 2:
+			if strings.HasPrefix(line[i:], `'''`) {
+				s.multiline = 0
+				i += 2
+			}
+		case c == '#':
+			return // comment runs to the end of the line
+		case c == '"':
+			if strings.HasPrefix(line[i:], `"""`) {
+				s.multiline = 1
+				i += 2
+				continue
+			}
+			i++
+			for i < len(line) && line[i] != '"' {
+				if line[i] == '\\' {
+					i++
+				}
+				i++
+			}
+		case c == '\'':
+			if strings.HasPrefix(line[i:], `'''`) {
+				s.multiline = 2
+				i += 2
+				continue
+			}
+			i++
+			for i < len(line) && line[i] != '\'' {
+				i++
+			}
+		case c == '[':
+			s.depth++
+		case c == ']':
+			if s.depth > 0 {
+				s.depth--
+			}
+		}
+	}
+}
+
+// parseTableHeader parses a single-line table header, reporting its dotted
+// key. It accepts bare, basic-string, and literal-string key parts, optional
+// whitespace, and a trailing comment, so [mcp_servers.ash],
+// [mcp_servers."ash"], ["mcp_servers".ash], and ["mcp_servers"."ash"] all
+// resolve to the same table. Array-of-tables headers are reported as headers
+// but flagged via aot.
+func parseTableHeader(line string) (key []string, aot bool, ok bool) {
+	s := strings.TrimSpace(line)
+	if !strings.HasPrefix(s, "[") {
+		return nil, false, false
+	}
+	if strings.HasPrefix(s, "[[") {
+		s = s[2:]
+		aot = true
+	} else {
+		s = s[1:]
+	}
+	var parts []string
+	for {
+		s = strings.TrimLeft(s, " \t")
+		part, rest, err := parseTOMLKeyPart(s)
+		if err != nil {
+			return nil, false, false
+		}
+		parts = append(parts, part)
+		s = strings.TrimLeft(rest, " \t")
+		if strings.HasPrefix(s, ".") {
+			s = s[1:]
+			continue
+		}
+		break
+	}
+	closing := "]"
+	if aot {
+		closing = "]]"
+	}
+	if !strings.HasPrefix(s, closing) {
+		return nil, false, false
+	}
+	s = strings.TrimLeft(s[len(closing):], " \t")
+	if s != "" && !strings.HasPrefix(s, "#") {
+		return nil, false, false
+	}
+	return parts, aot, true
+}
+
+// parseTOMLKeyPart parses one key part: bare, basic string, or literal string.
+func parseTOMLKeyPart(s string) (part, rest string, err error) {
+	switch {
+	case strings.HasPrefix(s, `"`):
+		i := 1
+		for i < len(s) {
+			if s[i] == '\\' {
+				i += 2
+				continue
+			}
+			if s[i] == '"' {
+				break
+			}
+			i++
+		}
+		if i >= len(s) {
+			return "", "", fmt.Errorf("unterminated basic-string key")
+		}
+		unquoted, uerr := strconv.Unquote(s[:i+1])
+		if uerr != nil {
+			return "", "", uerr
+		}
+		return unquoted, s[i+1:], nil
+	case strings.HasPrefix(s, `'`):
+		end := strings.IndexByte(s[1:], '\'')
+		if end < 0 {
+			return "", "", fmt.Errorf("unterminated literal-string key")
+		}
+		return s[1 : 1+end], s[2+end:], nil
+	default:
+		i := 0
+		for i < len(s) && isBareKeyChar(s[i]) {
+			i++
+		}
+		if i == 0 {
+			return "", "", fmt.Errorf("not a key part")
+		}
+		return s[:i], s[i:], nil
+	}
+}
+
+func isBareKeyChar(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-'
 }
 
 func renderOpenCode(existing []byte, command []string) ([]byte, error) {

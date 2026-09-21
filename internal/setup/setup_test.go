@@ -227,3 +227,187 @@ func TestCodexQuotedHeaderIsReplacedNotDuplicated(t *testing.T) {
 		t.Fatalf("expected exactly one mcp_servers entry, got %d:\n%s", len(doc.MCPServers), content)
 	}
 }
+
+// Every valid spelling of the ASH table header must be rewritten in place:
+// only the ASH table's lines change, all comments (before, inside, and after
+// unrelated sections) survive, and re-running setup is byte-for-byte
+// idempotent.
+func TestCodexQuotedSpellingsUpdatedInPlace(t *testing.T) {
+	spellings := []string{
+		`[mcp_servers.ash]`,
+		`[mcp_servers."ash"]`,
+		`["mcp_servers".ash]`,
+		`["mcp_servers"."ash"]`,
+	}
+	for _, spelling := range spellings {
+		t.Run(spelling, func(t *testing.T) {
+			home := t.TempDir()
+			setHome(t, home)
+			t.Setenv("CODEX_HOME", "")
+			path := filepath.Join(home, ".codex", "config.toml")
+			original := "# leading comment about the model\n" +
+				`model = "gpt-5"` + "\n\n" +
+				"# server definitions follow\n" +
+				"[mcp_servers.other]\n" +
+				"# other's command, unrelated to ash\n" +
+				`command = "other"` + "\n\n" +
+				"# ash section lives between others\n" +
+				spelling + "\n" +
+				`command = "old"` + "\n" +
+				"args = []\n\n" +
+				"# profile section after the servers\n" +
+				"[profile]\n" +
+				"# trailing comment inside profile\n" +
+				`style = "fast"` + "\n" +
+				"# trailing comment at end of file\n"
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			result, err := Run(baseOpts(t, "codex", UserScope, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.Written {
+				t.Fatalf("expected a write for %s: %+v", spelling, result)
+			}
+			content := result.Content
+			if strings.Contains(content, `"old"`) {
+				t.Fatalf("stale command kept for %s:\n%s", spelling, content)
+			}
+			if !strings.Contains(content, optsCommand(t)) {
+				t.Fatalf("new command missing for %s:\n%s", spelling, content)
+			}
+			// Exactly one ASH table, under the canonical spelling.
+			if strings.Count(content, "[mcp_servers.ash]") != 1 {
+				t.Fatalf("expected exactly one canonical ASH header for %s:\n%s", spelling, content)
+			}
+			if strings.Contains(content, spelling) && spelling != "[mcp_servers.ash]" {
+				t.Fatalf("old spelling survived for %s:\n%s", spelling, content)
+			}
+			// Every comment line must survive untouched.
+			for _, line := range strings.Split(original, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "#") && !strings.Contains(content, line) {
+					t.Fatalf("comment lost for %s: %q\noutput:\n%s", spelling, line, content)
+				}
+			}
+			// Unrelated values keep their exact bytes.
+			for _, want := range []string{`model = "gpt-5"`, `command = "other"`, `style = "fast"`} {
+				if !strings.Contains(content, want) {
+					t.Fatalf("unrelated entry changed for %s, missing %q:\n%s", spelling, want, content)
+				}
+			}
+			// Still valid TOML with exactly one ash entry.
+			var doc struct {
+				MCPServers map[string]any `toml:"mcp_servers"`
+			}
+			if err := toml.Unmarshal([]byte(content), &doc); err != nil {
+				t.Fatalf("output is not valid TOML for %s: %v\n%s", spelling, err, content)
+			}
+			if _, ok := doc.MCPServers["ash"]; !ok {
+				t.Fatalf("ash entry missing for %s:\n%s", spelling, content)
+			}
+			if len(doc.MCPServers) != 2 {
+				t.Fatalf("unexpected mcp_servers entries for %s:\n%s", spelling, content)
+			}
+			if _, ok := doc.MCPServers["other"]; !ok {
+				t.Fatalf("unrelated server lost for %s:\n%s", spelling, content)
+			}
+			// Re-running setup must be byte-for-byte idempotent.
+			second, err := Run(baseOpts(t, "codex", UserScope, ""))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.Written || second.Content != content {
+				t.Fatalf("setup not byte-for-byte idempotent for %s:\nfirst:\n%s\nsecond:\n%s", spelling, content, second.Content)
+			}
+		})
+	}
+}
+
+// optsCommand renders the command line setup writes, mirroring Run's
+// rendering of the configured ash path and config path.
+func optsCommand(t *testing.T) string {
+	t.Helper()
+	opts := baseOpts(t, "codex", UserScope, "")
+	return opts.AshPath
+}
+
+// A multi-line array and multi-line strings must not hide a table header from
+// the in-place updater: the literal "[mcp_servers.ash]" appearing inside them
+// is data, not a header.
+func TestCodexHeaderInsideMultilineDataIsNotAMember(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	t.Setenv("CODEX_HOME", "")
+	path := filepath.Join(home, ".codex", "config.toml")
+	original := "[other]\n" +
+		"text = \"\"\"\n" +
+		"[mcp_servers.ash]\n" +
+		"\"\"\"\n" +
+		"array = [\n" +
+		"\t\"[mcp_servers.ash]\",\n" +
+		"]\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Run(baseOpts(t, "codex", UserScope, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Written {
+		t.Fatal("expected a write")
+	}
+	// ASH did not exist as a table; setup must append it, not rewrite other.
+	// The literal header also appears inside the multi-line string and the
+	// array element, where it is data, so assert on parsed semantics.
+	var doc struct {
+		MCPServers map[string]any `toml:"mcp_servers"`
+		Other      map[string]any `toml:"other"`
+	}
+	if err := toml.Unmarshal([]byte(result.Content), &doc); err != nil {
+		t.Fatalf("output is not valid TOML: %v\n%s", err, result.Content)
+	}
+	if _, ok := doc.MCPServers["ash"]; !ok || len(doc.MCPServers) != 1 {
+		t.Fatalf("expected exactly the appended ash server: %+v\n%s", doc.MCPServers, result.Content)
+	}
+	text, _ := doc.Other["text"].(string)
+	if !strings.Contains(text, "[mcp_servers.ash]") {
+		t.Fatalf("multi-line string data damaged: %q\n%s", text, result.Content)
+	}
+	array, _ := doc.Other["array"].([]any)
+	if len(array) != 1 || array[0] != "[mcp_servers.ash]" {
+		t.Fatalf("array data damaged: %+v\n%s", array, result.Content)
+	}
+}
+
+// Invalid TOML must be reported, never overwritten.
+func TestCodexInvalidTOMLIsRejected(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	t.Setenv("CODEX_HOME", "")
+	path := filepath.Join(home, ".codex", "config.toml")
+	broken := "[mcp_servers.ash\ncommand = \"unterminated\"\n"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Run(baseOpts(t, "codex", UserScope, ""))
+	if err == nil {
+		t.Fatalf("invalid TOML accepted: %+v", result)
+	}
+	if !strings.Contains(err.Error(), "parse existing config") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	onDisk, readErr := os.ReadFile(path)
+	if readErr != nil || string(onDisk) != broken {
+		t.Fatalf("invalid config was overwritten: %v\n%s", readErr, onDisk)
+	}
+}
