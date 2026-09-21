@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -107,6 +108,13 @@ func (t *Transport) Remove(ctx context.Context, h host.Host, p string) error {
 
 // AtomicWrite replaces p completely or leaves the prior file intact by writing
 // a same-directory temporary file, syncing, and renaming it into place.
+//
+// Replacement requires atomic rename-over-existing, which the SFTP RENAME
+// operation does not provide: OpenSSH fails it with SSH_FX_FAILURE when the
+// target exists. The posix-rename@openssh.com extension performs a real
+// POSIX rename and is used instead; without it, no atomic replacement exists
+// and the operation fails rather than risking a delete-then-rename window
+// that would leave the destination missing on failure.
 func (t *Transport) AtomicWrite(ctx context.Context, h host.Host, p string, data []byte) error {
 	if len(data) > transport.MaxWriteSize {
 		return transport.ErrTooLarge
@@ -122,6 +130,43 @@ func (t *Transport) AtomicWrite(ctx context.Context, h host.Host, p string, data
 	if err != nil {
 		return operationError(ctx, err)
 	}
+	return operationError(ctx, atomicWriteSFTP(clientDialer{fs}, p, data))
+}
+
+// sftpDialer abstracts the part of the SFTP client used by the atomic write,
+// so tests can simulate servers lacking the posix-rename extension.
+// clientFile wraps *sftp.File, whose concrete OpenFile return type prevents
+// *sftp.Client from implementing this interface directly.
+type sftpFile interface {
+	Write([]byte) (int, error)
+	Sync() error
+	Chmod(os.FileMode) error
+	Close() error
+}
+
+type clientFile struct{ *sftp.File }
+
+type sftpDialer interface {
+	OpenFile(path string, f int) (sftpFile, error)
+	PosixRename(oldname, newname string) error
+	Remove(path string) error
+}
+
+// clientDialer adapts *sftp.Client to sftpDialer.
+type clientDialer struct{ *sftp.Client }
+
+func (c clientDialer) OpenFile(path string, f int) (sftpFile, error) {
+	file, err := c.Client.OpenFile(path, f)
+	if err != nil {
+		return nil, err
+	}
+	return clientFile{file}, nil
+}
+
+// atomicWriteSFTP writes data to a same-directory temporary file and renames
+// it over p atomically, or leaves p untouched: the temp file is always
+// removed on failure, and the rename never deletes the destination first.
+func atomicWriteSFTP(fs sftpDialer, p string, data []byte) error {
 	var random [8]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		return err
@@ -129,7 +174,7 @@ func (t *Transport) AtomicWrite(ctx context.Context, h host.Host, p string, data
 	temp := path.Join(path.Dir(p), ".ash-tmp-"+hex.EncodeToString(random[:]))
 	file, err := fs.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
 	if err != nil {
-		return operationError(ctx, err)
+		return err
 	}
 	removeTemp := true
 	defer func() {
@@ -139,25 +184,42 @@ func (t *Transport) AtomicWrite(ctx context.Context, h host.Host, p string, data
 	}()
 	closeWith := func(err error) error {
 		file.Close()
-		return operationError(ctx, err)
+		return err
 	}
 	if _, err := file.Write(data); err != nil {
 		return closeWith(err)
 	}
-	if err := file.Sync(); err != nil {
+	if err := file.Sync(); err != nil && !isUnsupportedOperation(err) {
+		// fsync@openssh.com is a durability optimization; servers without it
+		// still get correct atomicity from the rename below, so its absence
+		// is not an error.
 		return closeWith(err)
 	}
 	if err := file.Chmod(0644); err != nil {
 		return closeWith(err)
 	}
 	if err := file.Close(); err != nil {
-		return operationError(ctx, err)
+		return err
 	}
-	if err := fs.Rename(temp, p); err != nil {
-		return operationError(ctx, err)
+	if err := fs.PosixRename(temp, p); err != nil {
+		// A server that does not implement the extension answers with
+		// SSH_FX_OP_UNSUPPORTED; other status codes are real failures. In
+		// neither case is the destination touched.
+		if isUnsupportedOperation(err) {
+			return fmt.Errorf("atomic replacement is not supported by this SFTP server (missing posix-rename@openssh.com extension): %w", err)
+		}
+		return err
 	}
 	removeTemp = false
 	return nil
+} // isUnsupportedOperation reports whether an SFTP error means the server does
+// not implement the requested operation or extension.
+func isUnsupportedOperation(err error) bool {
+	var status *sftp.StatusError
+	if errors.As(err, &status) {
+		return status.FxCode() == sftp.ErrSSHFxOpUnsupported
+	}
+	return errors.Is(err, sftp.ErrSSHFxOpUnsupported)
 }
 
 type treeItem struct {

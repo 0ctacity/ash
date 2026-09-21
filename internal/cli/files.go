@@ -90,11 +90,15 @@ func runDownload(ctx context.Context, args []string, s *service.Service) error {
 	return nil
 }
 
-// mkdirAllSafe creates dir and any missing parents, refusing to traverse an
-// existing symlink component. Components at or below root are verified; the
-// root itself is the caller's responsibility.
+// mkdirAllSafe creates dir and any missing parents up to and including root,
+// refusing to traverse an existing symlink component. The destination root is
+// created when missing - including its missing ancestors - so a download into
+// a new directory works instead of failing on its first child.
 func mkdirAllSafe(dir, root string) error {
-	if dir == root || dir == string(filepath.Separator) || dir == "." {
+	if dir == root {
+		return mkdirComponent(dir, true)
+	}
+	if dir == string(filepath.Separator) || dir == "." {
 		return ensureNotSymlink(dir)
 	}
 	parent := filepath.Dir(dir)
@@ -103,6 +107,15 @@ func mkdirAllSafe(dir, root string) error {
 			return err
 		}
 	}
+	return mkdirComponent(dir, false)
+}
+
+// mkdirComponent ensures dir exists as a real directory, creating it when
+// missing. Every existing component is checked with Lstat, so a symlink is
+// never traversed. When withAncestors is set, missing parents are created the
+// same way; it is used for the destination root, whose ancestors may also be
+// missing.
+func mkdirComponent(dir string, withAncestors bool) error {
 	if err := ensureNotSymlink(dir); err != nil {
 		return err
 	}
@@ -114,6 +127,14 @@ func mkdirAllSafe(dir, root string) error {
 		return fmt.Errorf("%q exists and is not a directory", dir)
 	case !errors.Is(err, os.ErrNotExist):
 		return err
+	}
+	if withAncestors {
+		parent := filepath.Dir(dir)
+		if parent != dir {
+			if err := mkdirComponent(parent, true); err != nil {
+				return err
+			}
+		}
 	}
 	return os.Mkdir(dir, 0o755)
 }

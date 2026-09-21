@@ -87,3 +87,95 @@ func TestDownloadNormalTreeStillWorks(t *testing.T) {
 		t.Fatalf("top file: %q %v", data, err)
 	}
 }
+
+// A download into a missing destination root must create the root (including
+// its missing ancestors) instead of failing on the first child.
+func TestDownloadCreatesMissingDestinationRoot(t *testing.T) {
+	base := t.TempDir()
+	local := filepath.Join(base, "new", "nested", "root")
+	f := &fileTransport{readTree: []transport.TreeEntry{
+		{Path: "top.txt", Data: []byte("top")},
+		{Path: "sub", IsDir: true},
+		{Path: "sub/x.txt", Data: []byte("hi")},
+	}}
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}}), f)
+	if err := runDownload(context.Background(), []string{"h", "/remote", local}, s); err != nil {
+		t.Fatalf("download into missing root: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(local, "top.txt")); err != nil || string(data) != "top" {
+		t.Fatalf("top file: %q %v", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(local, "sub", "x.txt")); err != nil || string(data) != "hi" {
+		t.Fatalf("nested file: %q %v", data, err)
+	}
+	// Only the destination tree was created, nothing beside it.
+	entries, err := os.ReadDir(filepath.Join(base, "new", "nested"))
+	if err != nil || len(entries) != 1 || entries[0].Name() != "root" {
+		t.Fatalf("unexpected sibling entries: %+v %v", entries, err)
+	}
+}
+
+// An existing normal root keeps working (regression guard for root creation).
+func TestDownloadExistingRootStillWorks(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "existing")
+	if err := os.MkdirAll(local, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f := &fileTransport{readTree: []transport.TreeEntry{{Path: "x.txt", Data: []byte("x")}}}
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}}), f)
+	if err := runDownload(context.Background(), []string{"h", "/remote", local}, s); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(local, "x.txt")); err != nil || string(data) != "x" {
+		t.Fatalf("file: %q %v", data, err)
+	}
+}
+
+// A symlinked destination root is rejected even though the root is now
+// created when missing: existing symlinks are never traversed.
+func TestDownloadRefusesSymlinkedDestinationRoot(t *testing.T) {
+	base := t.TempDir()
+	outside := t.TempDir()
+	escape := filepath.Join(base, "out")
+	if err := os.Symlink(outside, escape); err != nil {
+		if strings.Contains(err.Error(), "symlink") && strings.Contains(err.Error(), "privilege") {
+			t.Skip("symlink creation not permitted")
+		}
+		t.Fatal(err)
+	}
+	f := &fileTransport{readTree: []transport.TreeEntry{{Path: "secret.txt", Data: []byte("pwn")}}}
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}}), f)
+	if err := runDownload(context.Background(), []string{"h", "/remote", escape}, s); err == nil {
+		t.Fatal("download into a symlinked root must fail")
+	} else if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "secret.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file escaped the download root: %v", err)
+	}
+}
+
+// Creating a missing root must not open a loophole: a symlinked ancestor of
+// the new root is still refused, so nothing is created beyond the symlink.
+func TestDownloadRefusesSymlinkedAncestorOfNewRoot(t *testing.T) {
+	base := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(base, "out")); err != nil {
+		if strings.Contains(err.Error(), "symlink") && strings.Contains(err.Error(), "privilege") {
+			t.Skip("symlink creation not permitted")
+		}
+		t.Fatal(err)
+	}
+	newRoot := filepath.Join(base, "out", "fresh")
+	f := &fileTransport{readTree: []transport.TreeEntry{{Path: "secret.txt", Data: []byte("pwn")}}}
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Read: true, Write: true}}}), f)
+	if err := runDownload(context.Background(), []string{"h", "/remote", newRoot}, s); err == nil {
+		t.Fatal("download through a symlinked ancestor must fail")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "fresh")); !os.IsNotExist(err) {
+		t.Fatalf("directory was created beyond the symlink: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "secret.txt")); !os.IsNotExist(err) {
+		t.Fatalf("file escaped the download root: %v", err)
+	}
+}

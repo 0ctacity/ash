@@ -12,6 +12,21 @@ Coverage includes commands, cwd and environment quoting, nonzero exit status, se
 
 Ordinary `go test ./...` skips the local daemon fixture unless `ASH_INTEGRATION=1` is set. Docker is not required; the development environment's Docker daemon was unavailable, so the fixture uses real local OpenSSH instead. Stalled SFTP subsystem negotiation is not separately simulated.
 
+## Opt-in SFTP replacement test against a configured host
+
+`TestFedoraSFTPReplacement` verifies `ash write --atomic` semantics on a real
+OpenSSH server: initial creation into a missing directory, replacement of an
+existing file (which requires the `posix-rename@openssh.com` extension), and
+the absence of leftover `.ash-tmp-` files. It touches only a unique path under
+`~/.cache/ash-integration-<random>` and removes it afterwards, even on failure.
+
+```sh
+ASH_SFTP_HOST=fedora ASH_CONFIG="$HOME/.config/ash/config.toml" \
+  go test -v ./integration -run TestFedoraSFTPReplacement
+```
+
+The host must have `write = true` in the referenced config.
+
 An explicitly configured identity must currently be a readable, unencrypted private key even when an agent is present. For encrypted keys, load the key into your SSH agent and omit `identity` from ASH configuration.
 
 ## Persistent Zellij shells
