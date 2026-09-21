@@ -15,10 +15,14 @@ Ordinary `go test ./...` skips the local daemon fixture unless `ASH_INTEGRATION=
 ## Opt-in SFTP replacement test against a configured host
 
 `TestFedoraSFTPReplacement` verifies `ash write --atomic` semantics on a real
-OpenSSH server: initial creation into a missing directory, replacement of an
-existing file (which requires the `posix-rename@openssh.com` extension), and
-the absence of leftover `.ash-tmp-` files. It touches only a unique path under
-`~/.cache/ash-integration-<random>` and removes it afterwards, even on failure.
+OpenSSH server: creation of a unique remote test directory, an initial atomic
+write, replacement of the existing file (which requires the
+`posix-rename@openssh.com` extension), verification of the replaced content,
+and the absence of leftover `.ash-tmp-` files. Remote paths are written as
+`~/.cache/ash-integration-<random>/atomic.txt` and resolved by the remote
+side, so the local operating system never influences them. The test directory
+is created before the first write and everything is removed through SFTP
+afterwards, even on failure.
 
 ```sh
 ASH_SFTP_HOST=fedora ASH_CONFIG="$HOME/.config/ash/config.toml" \

@@ -17,6 +17,15 @@ import (
 // direct pipes, so AtomicWrite runs against real sftp.Client semantics -
 // including the posix-rename@openssh.com round trip - without any network or
 // configured host. The transport's SFTP dial is replaced by the fixture.
+//
+// The server's working directory is pinned to the fixture root and every test
+// addresses files with POSIX-style *relative* remote paths, mirroring how
+// production code handles remote paths (and derives temporary paths with
+// POSIX path.Dir). Relative paths keep the client- and server-side spelling
+// identical on every platform: on Windows an absolute POSIX path would be
+// reinterpreted against a drive ("cannot move the file to a different disk
+// drive"), while a relative path always resolves into the single temporary
+// root and can never cross drives.
 type sftpFixture struct {
 	tr   *Transport
 	h    host.Host
@@ -37,7 +46,7 @@ func newSFTPFixture(t *testing.T) *sftpFixture {
 	server, err := sftp.NewServer(struct {
 		io.Reader
 		io.WriteCloser
-	}{serverRead, serverWrite})
+	}{serverRead, serverWrite}, sftp.WithServerWorkingDirectory(dir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +93,9 @@ func (f *sftpFixture) sftpFor(t *testing.T) *sftp.Client {
 func TestAtomicWriteCreatesAndReplacesOverSFTP(t *testing.T) {
 	f := newSFTPFixture(t)
 	ctx := context.Background()
-	target := filepath.Join(f.root, "atomic-create-replace.txt")
+	// Relative POSIX remote path, resolved by the server against its working
+	// directory (the fixture root) on every platform.
+	target := "atomic-create-replace.txt"
 
 	if err := f.tr.AtomicWrite(ctx, f.h, target, []byte("first")); err != nil {
 		t.Fatal(err)
@@ -103,7 +114,7 @@ func TestAtomicWriteCreatesAndReplacesOverSFTP(t *testing.T) {
 func TestAtomicWriteFailureKeepsOldDestinationAndCleansTemp(t *testing.T) {
 	f := newSFTPFixture(t)
 	ctx := context.Background()
-	target := filepath.Join(f.root, "atomic-keep-old.txt")
+	target := "atomic-keep-old.txt"
 
 	if err := f.tr.Mkdir(ctx, f.h, target); err != nil {
 		t.Fatal(err)
@@ -133,8 +144,14 @@ func TestAtomicWriteWithoutPosixRenameExtensionIsUnsupported(t *testing.T) {
 		t.Fatal("plain errors must not be treated as unsupported")
 	}
 
+	// The helper derives the temporary path with POSIX path.Dir, so the
+	// destination must be a POSIX-style path too. Chdir into a unique
+	// directory and use a relative path: on Windows a drive-letter destination
+	// would make path.Dir degenerate to "." and leak the temp file into the
+	// package working directory.
 	dir := t.TempDir()
-	destination := filepath.Join(dir, "config.txt")
+	t.Chdir(dir)
+	destination := "config.txt"
 	if err := os.WriteFile(destination, []byte("keep me"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +199,7 @@ func (l *legacyServer) Remove(path string) error {
 // POSIX semantics, proving the fixture supports what AtomicWrite needs.
 func TestPosixRenameReplacesExisting(t *testing.T) {
 	f := newSFTPFixture(t)
-	a, b := filepath.Join(f.root, "posix-a.txt"), filepath.Join(f.root, "posix-b.txt")
+	a, b := "posix-a.txt", "posix-b.txt"
 	if err := f.tr.Write(context.Background(), f.h, a, []byte("A")); err != nil {
 		t.Fatal(err)
 	}
