@@ -119,20 +119,43 @@ func (d *Doctor) shellCheck(ctx context.Context, h host.Host) Check {
 	return Check{Name: "shell", Status: StatusOK, Message: "POSIX shell available"}
 }
 
+// cacheCheckCommand reports the remote cache state through distinct exit
+// codes in one non-mutating probe: 0 = ~/.cache/ash exists and is writable,
+// 1 = the cache location is not writable, 2 = a cache path component exists
+// but is not a directory, 3 = the cache directory is missing and the nearest
+// creatable parent is writable. Combining existence and writability keeps a
+// transport failure distinguishable from any shell exit code.
+const cacheCheckCommand = `if [ -d "$HOME/.cache/ash" ]; then ` +
+	`if [ -w "$HOME/.cache/ash" ]; then exit 0; else exit 1; fi; ` +
+	`elif [ -e "$HOME/.cache/ash" ]; then exit 2; ` +
+	`elif [ -d "$HOME/.cache" ]; then ` +
+	`if [ -w "$HOME/.cache" ]; then exit 3; else exit 1; fi; ` +
+	`elif [ -e "$HOME/.cache" ]; then exit 2; ` +
+	`elif [ -w "$HOME" ]; then exit 3; ` +
+	`else exit 1; fi`
+
 // cacheCheck verifies the remote cache location without mutating the host:
 // it inspects what exists (or what could be created) with a shell test only.
 // A missing ~/.cache/ash is reported as a warning rather than created, since
 // diagnostics must not change the host.
 func (d *Doctor) cacheCheck(ctx context.Context, h host.Host) Check {
-	r, err := d.exec(ctx, h, `if [ -d "$HOME/.cache/ash" ]; then test -w "$HOME/.cache/ash"; else test -w "$HOME/.cache" || test -w "$HOME"; fi`)
-	if err != nil || r.ExitCode != 0 {
+	r, err := d.exec(ctx, h, cacheCheckCommand)
+	if err != nil {
+		// A transport failure is a connectivity problem, never evidence about
+		// the cache; classify it like the other remote checks instead of
+		// treating the zero-value exit code as a healthy directory.
+		return classify(err)
+	}
+	switch r.ExitCode {
+	case 0:
+		return Check{Name: "cache", Status: StatusOK, Message: "remote cache directory is writable"}
+	case 3:
+		return Check{Name: "cache", Status: StatusWarn, Message: "remote cache directory is missing; ASH will create it on first use", Hint: "mkdir -p ~/.cache/ash (created automatically later)"}
+	case 2:
+		return Check{Name: "cache", Status: StatusFail, Message: "$HOME/.cache/ash exists but is not a directory", Hint: "remove or rename it so ASH can create the cache directory"}
+	default:
 		return Check{Name: "cache", Status: StatusFail, Message: "remote cache directory is not writable", Hint: "check permissions on $HOME/.cache"}
 	}
-	exists, _ := d.exec(ctx, h, `test -d "$HOME/.cache/ash"`)
-	if exists.ExitCode != 0 {
-		return Check{Name: "cache", Status: StatusWarn, Message: "remote cache directory is missing; ASH will create it on first use", Hint: "mkdir -p ~/.cache/ash (created automatically later)"}
-	}
-	return Check{Name: "cache", Status: StatusOK, Message: "remote cache directory is writable"}
 }
 
 func (d *Doctor) zellijCheck(ctx context.Context, h host.Host) Check {
