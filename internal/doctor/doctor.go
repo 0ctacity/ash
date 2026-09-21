@@ -120,19 +120,28 @@ func (d *Doctor) shellCheck(ctx context.Context, h host.Host) Check {
 }
 
 // cacheCheckCommand reports the remote cache state through distinct exit
-// codes in one non-mutating probe: 0 = ~/.cache/ash exists and is writable,
-// 1 = the cache location is not writable, 2 = a cache path component exists
-// but is not a directory, 3 = the cache directory is missing and the nearest
-// creatable parent is writable. Combining existence and writability keeps a
-// transport failure distinguishable from any shell exit code.
+// codes in one non-mutating probe:
+//
+//	0 = ~/.cache/ash exists and is writable
+//	1 = ~/.cache/ash exists but is not writable
+//	2 = ~/.cache/ash exists but is not a directory
+//	3 = ~/.cache/ash is missing and the nearest creatable parent is writable
+//	4 = ~/.cache exists but is not a directory
+//	5 = ~/.cache/ash is missing and the nearest parent is not writable
+//
+// The two non-directory states get separate codes because the blocking
+// component differs: when ~/.cache itself is a file, ASH cannot create the
+// cache directory regardless of anything else. Combining existence and
+// writability keeps a transport failure distinguishable from any shell exit
+// code.
 const cacheCheckCommand = `if [ -d "$HOME/.cache/ash" ]; then ` +
 	`if [ -w "$HOME/.cache/ash" ]; then exit 0; else exit 1; fi; ` +
 	`elif [ -e "$HOME/.cache/ash" ]; then exit 2; ` +
 	`elif [ -d "$HOME/.cache" ]; then ` +
-	`if [ -w "$HOME/.cache" ]; then exit 3; else exit 1; fi; ` +
-	`elif [ -e "$HOME/.cache" ]; then exit 2; ` +
+	`if [ -w "$HOME/.cache" ]; then exit 3; else exit 5; fi; ` +
+	`elif [ -e "$HOME/.cache" ]; then exit 4; ` +
 	`elif [ -w "$HOME" ]; then exit 3; ` +
-	`else exit 1; fi`
+	`else exit 5; fi`
 
 // cacheCheck verifies the remote cache location without mutating the host:
 // it inspects what exists (or what could be created) with a shell test only.
@@ -149,12 +158,16 @@ func (d *Doctor) cacheCheck(ctx context.Context, h host.Host) Check {
 	switch r.ExitCode {
 	case 0:
 		return Check{Name: "cache", Status: StatusOK, Message: "remote cache directory is writable"}
-	case 3:
-		return Check{Name: "cache", Status: StatusWarn, Message: "remote cache directory is missing; ASH will create it on first use", Hint: "mkdir -p ~/.cache/ash (created automatically later)"}
+	case 1:
+		return Check{Name: "cache", Status: StatusFail, Message: "remote cache directory is not writable", Hint: "check permissions on $HOME/.cache/ash"}
 	case 2:
 		return Check{Name: "cache", Status: StatusFail, Message: "$HOME/.cache/ash exists but is not a directory", Hint: "remove or rename it so ASH can create the cache directory"}
+	case 3:
+		return Check{Name: "cache", Status: StatusWarn, Message: "remote cache directory is missing; ASH will create it on first use", Hint: "mkdir -p ~/.cache/ash (created automatically later)"}
+	case 4:
+		return Check{Name: "cache", Status: StatusFail, Message: "$HOME/.cache exists but is not a directory", Hint: "remove or rename it so ASH can create the cache directory"}
 	default:
-		return Check{Name: "cache", Status: StatusFail, Message: "remote cache directory is not writable", Hint: "check permissions on $HOME/.cache"}
+		return Check{Name: "cache", Status: StatusFail, Message: "remote cache directory is missing and $HOME/.cache is not writable", Hint: "check permissions on $HOME/.cache or create it yourself"}
 	}
 }
 

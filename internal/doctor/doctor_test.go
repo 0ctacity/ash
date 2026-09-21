@@ -193,13 +193,16 @@ func TestCacheCheckDoesNotMutate(t *testing.T) {
 
 func TestCacheCheckStates(t *testing.T) {
 	cases := map[string]struct {
-		result transport.ExecResult
-		want   Status
+		result      transport.ExecResult
+		want        Status
+		wantMessage string
 	}{
-		"existing writable cache":            {transport.ExecResult{}, StatusOK},
-		"missing cache with writable parent": {transport.ExecResult{ExitCode: 3}, StatusWarn},
-		"existing non-writable cache":        {transport.ExecResult{ExitCode: 1}, StatusFail},
-		"cache path is not a directory":      {transport.ExecResult{ExitCode: 2}, StatusFail},
+		"existing writable cache":               {transport.ExecResult{ExitCode: 0}, StatusOK, "remote cache directory is writable"},
+		"existing non-writable cache":           {transport.ExecResult{ExitCode: 1}, StatusFail, "remote cache directory is not writable"},
+		"cache exists but is not a directory":   {transport.ExecResult{ExitCode: 2}, StatusFail, "$HOME/.cache/ash exists but is not a directory"},
+		"missing cache with writable parent":    {transport.ExecResult{ExitCode: 3}, StatusWarn, "remote cache directory is missing; ASH will create it on first use"},
+		"cache parent exists but is not a dir":  {transport.ExecResult{ExitCode: 4}, StatusFail, "$HOME/.cache exists but is not a directory"},
+		"missing cache without writable parent": {transport.ExecResult{ExitCode: 5}, StatusFail, "remote cache directory is missing and $HOME/.cache is not writable"},
 	}
 	for name, tc := range cases {
 		f := &fakeTransport{results: map[string]transport.ExecResult{cacheCheckCommand: tc.result}}
@@ -211,20 +214,36 @@ func TestCacheCheckStates(t *testing.T) {
 		if got.Status != tc.want {
 			t.Fatalf("%s: cache = %s, want %s (%+v)", name, got.Status, tc.want, got)
 		}
+		if got.Message != tc.wantMessage {
+			t.Fatalf("%s: message = %q, want %q", name, got.Message, tc.wantMessage)
+		}
 	}
 }
 
-func TestCacheCheckNonDirectoryFallback(t *testing.T) {
-	// The .cache parent itself exists but is not a directory; the probe must
-	// reach the non-directory branch (exit 2) rather than the writable-parent
-	// branch, so the report distinguishes a blocking path from a missing one.
-	f := &fakeTransport{results: map[string]transport.ExecResult{
-		cacheCheckCommand: {ExitCode: 2},
-	}}
-	report := testDoctor(t, f, policy.Policy{Exec: true}).Run(context.Background(), "h")
-	check, ok := findCheck(report.Checks, "cache")
-	if !ok || check.Status != StatusFail || !strings.Contains(check.Message, "not a directory") {
-		t.Fatalf("expected non-directory failure, got %+v", report.Checks)
+// The two non-directory states must be distinguishable: the message has to
+// name the component that actually blocks the path, because the remedy
+// differs (the blocking file may sit at ~/.cache itself rather than
+// ~/.cache/ash).
+func TestCacheCheckNonDirectoryMessages(t *testing.T) {
+	cases := map[string]struct {
+		exitCode int
+		want     string
+	}{
+		"ash path is not a directory":   {2, "$HOME/.cache/ash exists but is not a directory"},
+		"cache path is not a directory": {4, "$HOME/.cache exists but is not a directory"},
+	}
+	for name, tc := range cases {
+		f := &fakeTransport{results: map[string]transport.ExecResult{
+			cacheCheckCommand: {ExitCode: tc.exitCode},
+		}}
+		report := testDoctor(t, f, policy.Policy{Exec: true}).Run(context.Background(), "h")
+		check, ok := findCheck(report.Checks, "cache")
+		if !ok || check.Status != StatusFail {
+			t.Fatalf("%s: expected failing cache check, got %+v", name, report.Checks)
+		}
+		if check.Message != tc.want {
+			t.Fatalf("%s: message = %q, want %q", name, check.Message, tc.want)
+		}
 	}
 }
 
