@@ -24,9 +24,22 @@ func ValidateID(id string) error {
 	return nil
 }
 
+// ReadRequest requests either a full snapshot or only output added since a
+// previous read identified by Cursor.
+type ReadRequest struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
 type Output struct {
-	Content   string `json:"content"`
-	Truncated bool   `json:"truncated"`
+	Content string `json:"content"`
+	// Cursor encodes the consumed prefix of the current snapshot and can be
+	// passed to the next ReadRequest.
+	Cursor string `json:"cursor"`
+	// Truncated reports that the underlying snapshot hit the transport bound.
+	Truncated bool `json:"truncated"`
+	// Resync reports that the cursor could not be applied, so Content is a full
+	// bounded snapshot instead of a suffix.
+	Resync bool `json:"resync"`
 }
 type Info struct {
 	ID      string `json:"id"`
@@ -38,6 +51,6 @@ type Backend interface {
 	Create(context.Context, host.Host, string, string) error
 	List(context.Context, host.Host) ([]string, error)
 	Send(context.Context, host.Host, string, string) error
-	Read(context.Context, host.Host, string) (Output, error)
+	Read(context.Context, host.Host, string, ReadRequest) (Output, error)
 	Close(context.Context, host.Host, string) error
 }

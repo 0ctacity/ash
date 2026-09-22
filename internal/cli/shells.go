@@ -61,12 +61,33 @@ func runShell(ctx context.Context, args []string, s *service.ShellService, in io
 		}
 		return s.Send(ctx, name, args[2], input)
 	case "read":
-		if len(args) != 3 {
-			return fmt.Errorf("shell read requires HOST ID")
+		if len(args) < 3 {
+			return fmt.Errorf("shell read requires HOST ID [--cursor VALUE] [--json]")
 		}
-		output, err := s.Read(ctx, name, args[2])
+		cursor := ""
+		asJSON := false
+		for i := 3; i < len(args); i++ {
+			switch {
+			case args[i] == "--json":
+				asJSON = true
+			case args[i] == "--cursor":
+				i++
+				if i == len(args) {
+					return fmt.Errorf("--cursor requires a value")
+				}
+				cursor = args[i]
+			case strings.HasPrefix(args[i], "--cursor="):
+				cursor = strings.TrimPrefix(args[i], "--cursor=")
+			default:
+				return fmt.Errorf("unknown shell read option %q", args[i])
+			}
+		}
+		output, err := s.Read(ctx, name, args[2], cursor)
 		if err != nil {
 			return err
+		}
+		if asJSON {
+			return json.NewEncoder(out).Encode(output)
 		}
 		if _, err = io.WriteString(out, output.Content); err != nil {
 			return err

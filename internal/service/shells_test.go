@@ -12,10 +12,11 @@ import (
 )
 
 type shellBackend struct {
-	calls int
-	ids   []string
-	input string
-	cwd   string
+	calls  int
+	ids    []string
+	input  string
+	cwd    string
+	cursor string
 }
 
 func (b *shellBackend) Name() string { return "test" }
@@ -34,9 +35,10 @@ func (b *shellBackend) Send(_ context.Context, _ host.Host, id, input string) er
 	b.input = input
 	return nil
 }
-func (b *shellBackend) Read(context.Context, host.Host, string) (shell.Output, error) {
+func (b *shellBackend) Read(_ context.Context, _ host.Host, _ string, req shell.ReadRequest) (shell.Output, error) {
 	b.calls++
-	return shell.Output{Content: "output"}, nil
+	b.cursor = req.Cursor
+	return shell.Output{Content: "output", Cursor: "cur"}, nil
 }
 func (b *shellBackend) Close(context.Context, host.Host, string) error {
 	b.calls++
@@ -52,7 +54,7 @@ func TestShellPolicyDeniesEveryOperationBeforeBackend(t *testing.T) {
 	_, e1 := s.Create(ctx, "h", "")
 	_, e2 := s.List(ctx, "h")
 	e3 := s.Send(ctx, "h", id, "pwd\n")
-	_, e4 := s.Read(ctx, "h", id)
+	_, e4 := s.Read(ctx, "h", id, "")
 	e5 := s.Close(ctx, "h", id)
 	for _, err := range []error{e1, e2, e3, e4, e5} {
 		if !errors.Is(err, policy.ErrPermissionDenied) {
@@ -86,8 +88,8 @@ func TestShellServiceUsesBackendAcrossInstances(t *testing.T) {
 	if err = s.Send(ctx, "h", info.ID, "printf literal\n"); err != nil || backend.input != "printf literal\n" {
 		t.Fatalf("input %q %v", backend.input, err)
 	}
-	output, err := s.Read(ctx, "h", info.ID)
-	if err != nil || output.Content != "output" {
+	output, err := s.Read(ctx, "h", info.ID, "cursor-value")
+	if err != nil || output.Content != "output" || output.Cursor != "cur" || backend.cursor != "cursor-value" {
 		t.Fatalf("%+v %v", output, err)
 	}
 	// Liveness comes from the backend, not a record created by this service.
@@ -122,6 +124,9 @@ func TestShellValidationAndCancellation(t *testing.T) {
 	}
 	if _, err := s.Create(ctx, "missing", ""); !errors.Is(err, host.ErrHostNotFound) {
 		t.Fatal(err)
+	}
+	if _, err := s.Read(ctx, "h", id, strings.Repeat("a", shell.MaxCursorSize+1)); err == nil {
+		t.Fatal("accepted oversized cursor")
 	}
 	if backend.calls != 0 {
 		t.Fatalf("backend called %d times", backend.calls)

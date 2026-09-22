@@ -138,13 +138,34 @@ func (b *Backend) Send(ctx context.Context, h host.Host, id, input string) error
 	_, err = b.run(ctx, h, sessionCommand(id)+"--session "+sshtransport.QuoteShell("ash-"+id)+" action write-chars --pane-id "+pane+" -- "+sshtransport.QuoteShell(input), "")
 	return err
 }
-func (b *Backend) Read(ctx context.Context, h host.Host, id string) (shell.Output, error) {
+func (b *Backend) Read(ctx context.Context, h host.Host, id string, req shell.ReadRequest) (shell.Output, error) {
 	pane, err := b.terminal(ctx, h, id)
 	if err != nil {
 		return shell.Output{}, err
 	}
 	r, err := b.run(ctx, h, sessionCommand(id)+"--session "+sshtransport.QuoteShell("ash-"+id)+" action dump-screen --full --pane-id "+pane, "")
-	return shell.Output{Content: r.Stdout, Truncated: r.StdoutTruncated}, err
+	if err != nil {
+		return shell.Output{}, err
+	}
+	output := shell.Output{Truncated: r.StdoutTruncated}
+	if req.Cursor == "" {
+		output.Content = r.Stdout
+	} else if cursor, decodeErr := shell.DecodeCursor(req.Cursor); decodeErr != nil {
+		// A malformed or expired cursor is not fatal: return a fresh snapshot.
+		output.Content = r.Stdout
+		output.Resync = true
+	} else if suffix, ok := shell.Apply(cursor, id, pane, []byte(r.Stdout)); ok {
+		output.Content = string(suffix)
+	} else {
+		output.Content = r.Stdout
+		output.Resync = true
+	}
+	cursor, err := shell.EncodeCursor(id, pane, []byte(r.Stdout))
+	if err != nil {
+		return shell.Output{}, err
+	}
+	output.Cursor = cursor
+	return output, nil
 }
 func (b *Backend) Close(ctx context.Context, h host.Host, id string) error {
 	if err := shell.ValidateID(id); err != nil {
