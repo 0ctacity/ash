@@ -12,6 +12,7 @@ const (
 	MaxReadSize        = 4 << 20
 	MaxWriteSize       = 4 << 20
 	MaxOutputSize      = 8 << 20
+	MaxExecInputSize   = 64 << 10
 	DefaultExecTimeout = 5 * time.Minute
 	DefaultFileTimeout = 30 * time.Second
 
@@ -27,12 +28,17 @@ var (
 	ErrHostKey        = errors.New("host key verification failed")
 	ErrTimeout        = errors.New("operation timed out")
 	ErrTooLarge       = errors.New("file exceeds size limit")
+	ErrInputTooLarge  = errors.New("input exceeds size limit")
 )
 
 type ExecRequest struct {
 	Host, Command, Cwd string
 	Env                map[string]string
 	Timeout            time.Duration
+	// Stdin is bounded binary input forwarded to the remote process. StdinSet
+	// distinguishes an explicit empty input from no input at all.
+	Stdin    []byte
+	StdinSet bool
 }
 type ExecResult struct {
 	ExitCode                         int

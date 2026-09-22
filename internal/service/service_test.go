@@ -125,6 +125,36 @@ func TestTreeOpsValidateBeforeTransport(t *testing.T) {
 	}
 }
 
+type execRecorder struct {
+	transport.Transport
+	request transport.ExecRequest
+	reached bool
+}
+
+func (r *execRecorder) Exec(_ context.Context, _ host.Host, req transport.ExecRequest) (transport.ExecResult, error) {
+	r.request = req
+	r.reached = true
+	return transport.ExecResult{}, nil
+}
+
+func TestExecStdinBoundAndEmptyDistinct(t *testing.T) {
+	r := new(execRecorder)
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), r)
+	ctx := context.Background()
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "cat", Stdin: make([]byte, transport.MaxExecInputSize+1), StdinSet: true}); err == nil {
+		t.Fatal("oversized exec input accepted")
+	}
+	if r.reached {
+		t.Fatal("oversized input reached transport")
+	}
+	if _, err := s.Exec(ctx, transport.ExecRequest{Host: "h", Command: "cat", StdinSet: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.request.StdinSet || len(r.request.Stdin) != 0 {
+		t.Fatalf("empty stdin not distinguished: %+v", r.request)
+	}
+}
+
 func TestTextAndWireTimeoutValidation(t *testing.T) {
 	if _, err := Text([]byte{0xff}); err == nil {
 		t.Fatal("invalid UTF-8 accepted")

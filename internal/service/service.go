@@ -74,6 +74,9 @@ func (s *Service) Exec(ctx context.Context, req transport.ExecRequest) (transpor
 	if req.Command == "" {
 		return transport.ExecResult{}, fmt.Errorf("command must not be empty")
 	}
+	if len(req.Stdin) > transport.MaxExecInputSize {
+		return transport.ExecResult{}, fmt.Errorf("exec input exceeds %d byte limit", transport.MaxExecInputSize)
+	}
 	if req.Timeout < 0 {
 		return transport.ExecResult{}, fmt.Errorf("timeout must be positive")
 	}

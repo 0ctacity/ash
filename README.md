@@ -68,8 +68,13 @@ Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH
 
 ```sh
 ./ash hosts
+./ash host add fedora --address 100.64.1.20 --user ata --exec --read --write
+./ash doctor
+./ash doctor fedora
+./ash doctor fedora --json
 ./ash exec fedora -- uname -a
 ./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
+printf '{"ok":true}' | ./ash exec fedora --stdin -- elephant receive
 ./ash read fedora /etc/os-release
 printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt --atomic
@@ -94,13 +99,28 @@ Command stdout and stderr stay separate, and the CLI returns the remote process 
 
 `mkdir` creates one directory without implicit parents. `rename` moves a file or directory. `remove` deletes a file or an empty directory and is never recursive; enumerate a tree with `list` before deleting it. `download` and `upload` map a bounded remote tree to and from a local directory without archives: remote symlinks are skipped, and absolute paths, `..`, NUL, duplicates, type conflicts, depth/entry/byte limits (depth 32, 1000 entries, 4 MiB) are rejected before the first remote mutation. A recursive transfer that fails part-way leaves earlier entries in place; there is no rollback.
 
+`host add` appends a minimal, deny-by-default entry to the configuration file. It never overwrites an existing host or an unparseable file; capabilities are granted explicitly with `--exec`, `--read`, and `--write`.
+
+`doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and Zellij availability as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
+
+Pass `--stdin` to forward standard input to the remote command, avoiding shell-quoting and command-size limits. Input is bounded at 64 KiB and fails clearly when exceeded. Without `--stdin`, ASH neither reads nor forwards standard input.
+
 Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Each operation opens and closes its own SSH connection.
 
 Each command output stream is capped at 8 MiB and reports truncation. Reads and writes are capped at 4 MiB. These limits bound captured output/file data, not all memory used by an MCP client's incoming protocol message.
 
 ## Persistent shells
 
-Persistent shells use [Zellij’s headless CLI](https://zellij.dev/documentation/cli-recipes.html) and require Zellij 0.44 or newer installed on the remote host. They are separate from one-shot `exec`: shell variables, working directory, and running commands survive ASH process exits and SSH disconnects. ASH opens short SSH connections to control Zellij; it does not keep an SSH session alive.
+Persistent shells use a per-host backend. Zellij ([headless CLI](https://zellij.dev/documentation/cli-recipes.html), 0.44 or newer) is the default; tmux is selected with `shell_backend = "tmux"` and requires tmux on the remote host.
+
+```toml
+[hosts.fedora]
+address = "100.64.1.20"
+user = "ata"
+shell_backend = "tmux"
+```
+
+CLI and MCP behavior is backend-independent; backend-specific features are never exposed. Both backends map ASH-generated IDs to a reserved remote namespace (`ash-<id>`) and query the backend for liveness rather than trusting local metadata, so ASH lists and controls only its own sessions. tmux uses a dedicated server socket (`tmux -L ash`), keeping ASH sessions fully separate from the user's personal sessions. Shells are separate from one-shot `exec`: shell variables, working directory, and running commands survive ASH process exits and SSH disconnects. ASH opens short SSH connections to control the backend; it does not keep an SSH session alive.
 
 ```sh
 ./ash shell create fedora --cwd '~/projects'
@@ -112,16 +132,40 @@ Creation returns JSON containing an ASH `id`, `host`, and `backend`. Set `SHELL_
 ```sh
 printf 'pwd\n' | ./ash shell send fedora "$SHELL_ID"
 ./ash shell read fedora "$SHELL_ID"
+./ash shell wait fedora "$SHELL_ID" --until READY --timeout 30s
 ./ash shell close fedora "$SHELL_ID"
 ```
 
 `send` accepts an optional literal INPUT argument, or reads stdin when omitted. It adds no newline: include one to submit a command. It returns after delivering input, without waiting for the shell command to finish. Input is UTF-8 without NUL and is limited to 64 KiB.
 
-`read` returns a snapshot of rendered terminal text and available scrollback, with stdout and stderr merged. Repeated reads can repeat output. Snapshots are bounded by the existing 8 MiB transport limit and report truncation. This is a polling interface, with no incremental cursor, streaming, full-screen TUI support, or per-command exit status. Use one-shot `exec` when you need a structured command result.
+`read` returns rendered terminal text and available scrollback, with stdout and stderr merged. Without a cursor it returns a full snapshot (and may repeat previous output). `--json` includes an opaque `cursor`; pass `--cursor VALUE` on the next read to receive only output added since the snapshot that produced it. A cursor is a byte-delta optimization over append-like output, not a terminal event log: if the pane changed, scrollback was truncated, or a redraw altered earlier bytes, the read returns a full snapshot with `resync: true` and a fresh cursor. Expired or malformed cursors resynchronize rather than fail. Snapshots are bounded by the existing 8 MiB transport limit and report truncation. This is a polling interface, with no streaming or full-screen TUI support and no per-command exit status. Use one-shot `exec` when you need a structured command result.
+
+`wait` blocks until new output arrives, or until a `--until` literal or `--regex` expression appears, and returns the observed output plus the next cursor. `--timeout` must be positive and is capped at five minutes. On timeout the persistent shell stays open; `--json` reports `matched`, `timed_out`, `truncated`, and `resync`. Matching runs against the bounded new output across chunk boundaries. This observes terminal output, not command completion or exit status.
 
 Every shell operation requires the host's existing `exec` capability. No additional policy flag is introduced. ASH-generated IDs map to reserved remote session names; ASH lists and controls only sessions in that namespace. Liveness is queried from Zellij, with no local session metadata to become stale. Exited sessions are not listed. Closing a shell is idempotent and also removes its ASH-owned backend configuration after an external termination. The namespace is organizational ownership, not isolation from other processes running as the same remote account. Zellij startup settings live in the remote `~/.cache/ash/shells/ID/config.kdl` until the shell is closed; this file is configuration, not a liveness record.
 
 Control operations have a 30-second deadline. That deadline limits the control request, not the lifetime of the persistent shell or a command sent to it. Persistence covers ASH/SSH disconnects, not host reboots or termination of Zellij. Treat a canceled or failed send as potentially delivered; do not blindly retry commands with side effects.
+
+## Set up MCP with a coding agent
+
+`ash setup` registers ASH as a stdio MCP server using the absolute ASH executable path and your configuration file. Run it with the same `--config` value (if any) that you use for other commands:
+
+```sh
+./ash setup codex
+./ash setup opencode --scope project
+./ash setup freebuff --scope project
+./ash setup codex --print
+```
+
+| Agent | Scope | File |
+| --- | --- | --- |
+| Codex | user | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
+| Codex | project | `.codex/config.toml` |
+| OpenCode | user | `~/.config/opencode/opencode.json` |
+| OpenCode | project | `opencode.json` |
+| freebuff | project | `.agents/mcp.json` |
+
+Re-running setup updates the existing ASH entry in place instead of creating a duplicate, and leaves unrelated settings and comments untouched. `--print` shows the proposed configuration without writing any file. Restart the agent after setup so it reloads its configuration and starts the ASH server. Unsupported agents receive a clear diagnostic and a manual stdio configuration example.
 
 ## MCP
 
@@ -143,7 +187,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | Tool | Inputs | Result |
 | --- | --- | --- |
 | `ash_hosts` | `{}` | Public host metadata and capabilities |
-| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
+| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms`, `stdin`, `stdin_base64` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
 | `ash_read` | `host`, `path`; optional `encoding` (`text`/`base64`) | `content` or `content_base64`, and byte `size` |
 | `ash_write` | `host`, `path`, `content` or `content_base64` | Written byte `size` |
 | `ash_stat` | `host`, `path` | `path`, `size`, `mode`, `is_dir`, `modified_at` |
@@ -157,10 +201,11 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | `ash_shell_create` | `host`; optional `cwd` | `id`, `host`, `backend` |
 | `ash_shell_list` | `host` | `shells`: live ASH-owned shells |
 | `ash_shell_send` | `host`, `shell_id`, `input` | `sent` |
-| `ash_shell_read` | `host`, `shell_id` | `content`, `truncated` |
+| `ash_shell_read` | `host`, `shell_id`; optional `cursor` | `content`, `cursor`, `truncated`, `resync` |
+| `ash_shell_wait` | `host`, `shell_id`, `timeout_ms`; optional `cursor`, `until`, `regex` | `content`, `cursor`, `matched`, `truncated`, `resync`, `timed_out` |
 | `ash_shell_close` | `host`, `shell_id` | `closed` |
 
-A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. `ash_read` returns UTF-8 `content` by default and rejects invalid UTF-8; pass `encoding: "base64"` for binary files. `ash_write` and `ash_write_atomic` accept `content` or `content_base64`, but not both. Host listings omit identity paths and authentication internals.
+`ash_exec` accepts standard input as UTF-8 `stdin` or base64 `stdin_base64` (mutually exclusive, at most 64 KiB); set either to an empty value to send empty input. A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. `ash_read` returns UTF-8 `content` by default and rejects invalid UTF-8; pass `encoding: "base64"` for binary files. `ash_write` and `ash_write_atomic` accept `content` or `content_base64`, but not both. Host listings omit identity paths and authentication internals.
 
 Capabilities grant access with the remote account's permissions. They do not constrain paths or commands: an enabled `exec` capability can itself read or modify files. Configure only hosts and accounts you intend the connected agent to operate.
 
@@ -179,7 +224,7 @@ go vet ./...
 
 The tests cover configuration, policy, shell escaping, output limits, CLI behavior and the official MCP client/server protocol. Run `ASH_INTEGRATION=1 go test -race ./integration` to exercise a real local OpenSSH daemon. See [integration](integration/README.md) for prerequisites. The daemon fixture is skipped unless explicitly enabled.
 
-Persistent-shell integration requires a trusted host with Zellij 0.44 or newer:
+Persistent-shell integration requires a trusted host with Zellij 0.44 or newer (the tmux backend is unit-tested against exact command construction; opt-in remote tmux tests can use the same environment):
 
 ```sh
 ASH_ZELLIJ_HOST=fedora ASH_ZELLIJ_CONFIG="$HOME/.config/ash/config.toml" \
