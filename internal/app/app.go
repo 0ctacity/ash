@@ -17,6 +17,7 @@ import (
 	"ash/internal/host"
 	ashmcp "ash/internal/mcp"
 	"ash/internal/service"
+	"ash/internal/shell/tmux"
 	"ash/internal/shell/zellij"
 	sshtransport "ash/internal/transport/ssh"
 )
@@ -73,7 +74,7 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	}
 	hosts := host.New(c.Hosts)
 	s := service.New(hosts, t)
-	shells := service.NewShells(hosts, zellij.New(t))
+	shells := service.NewShellsWithBackends(hosts, zellij.New(t), tmux.New(t))
 	if args[0] == "doctor" {
 		return cli.Doctor(ctx, args[1:], doctor.New(hosts, t, filepath.Join(home, ".ssh", "known_hosts")), out, errout)
 	}

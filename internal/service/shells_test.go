@@ -105,6 +105,36 @@ func TestShellServiceUsesBackendAcrossInstances(t *testing.T) {
 	}
 }
 
+type namedBackend struct {
+	*shellBackend
+	name string
+}
+
+func (b *namedBackend) Name() string { return b.name }
+
+func TestShellServiceSelectsBackendPerHost(t *testing.T) {
+	zellijBackend := &namedBackend{shellBackend: new(shellBackend), name: "zellij"}
+	tmuxBackend := &namedBackend{shellBackend: new(shellBackend), name: "tmux"}
+	hosts := host.New(map[string]host.Host{
+		"z": {Policy: policy.Policy{Exec: true}},
+		"t": {Policy: policy.Policy{Exec: true}, ShellBackend: "tmux"},
+	})
+	s := NewShellsWithBackends(hosts, zellijBackend, tmuxBackend)
+	ctx := context.Background()
+	info, err := s.Create(ctx, "z", "")
+	if err != nil || info.Backend != "zellij" || zellijBackend.calls == 0 {
+		t.Fatalf("zellij: %+v %v", info, err)
+	}
+	info, err = s.Create(ctx, "t", "")
+	if err != nil || info.Backend != "tmux" || tmuxBackend.calls == 0 {
+		t.Fatalf("tmux: %+v %v", info, err)
+	}
+	unknown := NewShellsWithBackends(host.New(map[string]host.Host{"b": {Policy: policy.Policy{Exec: true}, ShellBackend: "nope"}}), zellijBackend)
+	if _, err := unknown.Create(ctx, "b", ""); err == nil {
+		t.Fatal("accepted unavailable backend")
+	}
+}
+
 type waitBackend struct {
 	shell.Backend
 	outputs []shell.Output

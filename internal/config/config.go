@@ -31,6 +31,11 @@ func Parse(data []byte) (Config, error) {
 		if h.Port < 1 || h.Port > 65535 {
 			return c, fmt.Errorf("host %q: invalid port %d", name, h.Port)
 		}
+		switch h.ShellBackend {
+		case "", "zellij", "tmux":
+		default:
+			return c, fmt.Errorf("host %q: shell_backend must be zellij or tmux", name)
+		}
 		h.Name = name
 		c.Hosts[name] = h
 	}
