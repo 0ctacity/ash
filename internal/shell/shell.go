@@ -6,9 +6,13 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"time"
 )
 
 const MaxInputSize = 64 << 10
+
+// MaxWaitOutputSize bounds the new output accumulated by one Wait call.
+const MaxWaitOutputSize = 8 << 20
 
 var (
 	ErrInvalidID   = errors.New("invalid shell ID")
@@ -24,20 +28,51 @@ func ValidateID(id string) error {
 	return nil
 }
 
+// ReadRequest requests either a full snapshot or only output added since a
+// previous read identified by Cursor.
+type ReadRequest struct {
+	Cursor string `json:"cursor,omitempty"`
+}
+
 type Output struct {
-	Content   string `json:"content"`
-	Truncated bool   `json:"truncated"`
+	Content string `json:"content"`
+	// Cursor encodes the consumed prefix of the current snapshot and can be
+	// passed to the next ReadRequest.
+	Cursor string `json:"cursor"`
+	// Truncated reports that the underlying snapshot hit the transport bound.
+	Truncated bool `json:"truncated"`
+	// Resync reports that the cursor could not be applied, so Content is a full
+	// bounded snapshot instead of a suffix.
+	Resync bool `json:"resync"`
 }
 type Info struct {
 	ID      string `json:"id"`
 	Host    string `json:"host"`
 	Backend string `json:"backend"`
 }
+
+// WaitRequest blocks until new output arrives or a matcher is satisfied.
+type WaitRequest struct {
+	Cursor  string
+	Literal string
+	Regex   string
+	Timeout time.Duration
+}
+
+// WaitResult reports newly observed output and the cursor for the next call.
+type WaitResult struct {
+	Content   string `json:"content"`
+	Cursor    string `json:"cursor"`
+	Matched   bool   `json:"matched"`
+	Truncated bool   `json:"truncated"`
+	Resync    bool   `json:"resync"`
+	TimedOut  bool   `json:"timed_out"`
+}
 type Backend interface {
 	Name() string
 	Create(context.Context, host.Host, string, string) error
 	List(context.Context, host.Host) ([]string, error)
 	Send(context.Context, host.Host, string, string) error
-	Read(context.Context, host.Host, string) (Output, error)
+	Read(context.Context, host.Host, string, ReadRequest) (Output, error)
 	Close(context.Context, host.Host, string) error
 }

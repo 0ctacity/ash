@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"ash/internal/config"
+	"ash/internal/doctor"
 	"ash/internal/host"
 	"ash/internal/policy"
 	"ash/internal/service"
@@ -43,6 +46,77 @@ func TestExecRequiresDelimiter(t *testing.T) {
 	}
 }
 
+func TestHostAddCommand(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	var out, errout bytes.Buffer
+	if code := HostAdd([]string{"fedora", "--address", "10.0.0.1", "--user", "ata", "--exec"}, path, &out, &errout); code != 0 || !strings.Contains(out.String(), `"host":"fedora"`) {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	c, err := config.Load(path)
+	if err != nil || !c.Hosts["fedora"].Policy.Exec || c.Hosts["fedora"].User != "ata" {
+		t.Fatalf("%v %+v", err, c.Hosts)
+	}
+	if code := HostAdd([]string{"bad", "--user", "u"}, path, &out, &errout); code != 1 {
+		t.Fatal("missing address accepted")
+	}
+}
+
+type doctorTransport struct{ transport.Transport }
+
+func (doctorTransport) Exec(context.Context, host.Host, transport.ExecRequest) (transport.ExecResult, error) {
+	return transport.ExecResult{}, nil
+}
+
+func TestDoctorCommandTextAndJSON(t *testing.T) {
+	known := filepath.Join(t.TempDir(), "known_hosts")
+	d := doctor.New(host.New(map[string]host.Host{"h": {Address: "a", Port: 22, User: "u", Policy: policy.Policy{Exec: true}}}), doctorTransport{}, known)
+	var out, errout bytes.Buffer
+	if code := Doctor(context.Background(), []string{"h"}, d, &out, &errout); code != 0 || !strings.Contains(out.String(), "trust") || !strings.Contains(out.String(), "host key verified") {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	out.Reset()
+	if code := Doctor(context.Background(), []string{"h", "--json"}, d, &out, &errout); code != 0 || !strings.HasPrefix(strings.TrimSpace(out.String()), "{") {
+		t.Fatalf("%d %q", code, out.String())
+	}
+	if code := Doctor(context.Background(), []string{"missing"}, d, &out, &errout); code != 1 {
+		t.Fatal("unknown host should fail")
+	}
+}
+
+func TestSetupCommandParsing(t *testing.T) {
+	var out, errout bytes.Buffer
+	if code := Setup(nil, "/usr/bin/ash", "/tmp/config.toml", &out, &errout); code != 0 || !strings.Contains(out.String(), "codex") || !strings.Contains(out.String(), "freebuff") {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	out.Reset()
+	errout.Reset()
+	if code := Setup([]string{"claude"}, "/usr/bin/ash", "/tmp/config.toml", &out, &errout); code != 1 || !strings.Contains(errout.String(), "Manual configuration example") {
+		t.Fatalf("%d %q", code, errout.String())
+	}
+}
+
+func TestExecStdinFlag(t *testing.T) {
+	r := new(recorder)
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), r)
+	var out, errout bytes.Buffer
+	code := Run(context.Background(), []string{"exec", "h", "--stdin", "--", "cat"}, s, nil, strings.NewReader("payload"), &out, &errout)
+	if code != 9 || string(r.request.Stdin) != "payload" || !r.request.StdinSet {
+		t.Fatalf("%d %+v %q", code, r.request, errout.String())
+	}
+	// Without --stdin, input is neither consumed nor forwarded.
+	r.request = transport.ExecRequest{}
+	code = Run(context.Background(), []string{"exec", "h", "--", "true"}, s, nil, strings.NewReader("ignored"), &out, &errout)
+	if code != 9 || r.request.StdinSet || r.request.Stdin != nil {
+		t.Fatalf("%d %+v", code, r.request)
+	}
+	// Oversized input fails clearly before reaching the transport.
+	r.request = transport.ExecRequest{}
+	code = Run(context.Background(), []string{"exec", "h", "--stdin", "--", "cat"}, s, nil, strings.NewReader(strings.Repeat("x", transport.MaxExecInputSize+1)), &out, &errout)
+	if code != 1 || r.request.StdinSet || !strings.Contains(errout.String(), "input exceeds") {
+		t.Fatalf("%d %+v %q", code, r.request, errout.String())
+	}
+}
+
 func TestWriteCancellationInterruptsStdin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -65,7 +139,7 @@ func TestWriteCancellationInterruptsStdin(t *testing.T) {
 
 type shellRecorder struct {
 	shell.Backend
-	input, cwd, id string
+	input, cwd, id, cursor string
 }
 
 func (r *shellRecorder) Name() string { return "test" }
@@ -103,8 +177,9 @@ func (r *shellRecorder) List(context.Context, host.Host) ([]string, error) {
 	}
 	return []string{r.id}, nil
 }
-func (r *shellRecorder) Read(context.Context, host.Host, string) (shell.Output, error) {
-	return shell.Output{Content: r.input, Truncated: true}, nil
+func (r *shellRecorder) Read(_ context.Context, _ host.Host, _ string, req shell.ReadRequest) (shell.Output, error) {
+	r.cursor = req.Cursor
+	return shell.Output{Content: r.input, Cursor: "next-cursor", Truncated: true}, nil
 }
 func (r *shellRecorder) Close(context.Context, host.Host, string) error { r.id = ""; return nil }
 func TestShellCLIListReadCloseAndInputLimit(t *testing.T) {
@@ -122,6 +197,15 @@ func TestShellCLIListReadCloseAndInputLimit(t *testing.T) {
 	}
 	if code := run("shell", "read", "h", id); code != 0 || out.String() != "captured output" || !strings.Contains(errout.String(), "truncated") {
 		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	if code := run("shell", "read", "h", id, "--cursor", "abc", "--json"); code != 0 || r.cursor != "abc" || !strings.Contains(out.String(), `"cursor":"next-cursor"`) {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	if code := run("shell", "wait", "h", id, "--until", "captured", "--timeout", "1s", "--json"); code != 0 || !strings.Contains(out.String(), `"matched":true`) {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	if code := run("shell", "wait", "h", id, "--until", "a", "--regex", "b"); code != 1 {
+		t.Fatal("accepted both matchers")
 	}
 	if code := Run(context.Background(), []string{"shell", "send", "h", id}, nil, shells, strings.NewReader(strings.Repeat("a", shell.MaxInputSize+1)), &out, &errout); code != 1 || r.input != "captured output" {
 		t.Fatalf("%d input mutated", code)
