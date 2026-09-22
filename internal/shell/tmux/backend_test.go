@@ -118,7 +118,7 @@ func TestReadAndCloseIdempotency(t *testing.T) {
 		{Stdout: "ash-" + testID + "\n"}, // live
 		{Stdout: "screen output\n"},      // capture-pane
 	}}
-	output, err := New(f).Read(context.Background(), host.Host{}, testID)
+	output, err := New(f).Read(context.Background(), host.Host{}, testID, shell.ReadRequest{})
 	if err != nil || output.Content != "screen output\n" {
 		t.Fatalf("%+v %v", output, err)
 	}
@@ -132,5 +132,23 @@ func TestReadAndCloseIdempotency(t *testing.T) {
 	}}
 	if err := New(f).Close(context.Background(), host.Host{}, testID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReadCursorReturnsOnlyNewOutput(t *testing.T) {
+	f := &fakeTransport{results: []transport.ExecResult{
+		{Stdout: "ash-" + testID + "\n"},
+		{Stdout: "first"},
+		{Stdout: "ash-" + testID + "\n"},
+		{Stdout: "first second"},
+	}}
+	b := New(f)
+	first, err := b.Read(context.Background(), host.Host{}, testID, shell.ReadRequest{})
+	if err != nil || first.Content != "first" || first.Cursor == "" {
+		t.Fatalf("first: %+v %v", first, err)
+	}
+	second, err := b.Read(context.Background(), host.Host{}, testID, shell.ReadRequest{Cursor: first.Cursor})
+	if err != nil || second.Content != " second" || second.Resync || second.Cursor == "" {
+		t.Fatalf("second: %+v %v", second, err)
 	}
 }

@@ -133,12 +133,33 @@ func (b *Backend) Send(ctx context.Context, h host.Host, id, input string) error
 	return err
 }
 
-func (b *Backend) Read(ctx context.Context, h host.Host, id string) (shell.Output, error) {
+func (b *Backend) Read(ctx context.Context, h host.Host, id string, req shell.ReadRequest) (shell.Output, error) {
 	if err := b.live(ctx, h, id); err != nil {
 		return shell.Output{}, err
 	}
 	r, err := b.run(ctx, h, tmux+"capture-pane -p -t "+sshtransport.QuoteShell(sessionName(id))+" -S -", "")
-	return shell.Output{Content: r.Stdout, Truncated: r.StdoutTruncated}, err
+	if err != nil {
+		return shell.Output{}, err
+	}
+	pane := sessionName(id)
+	output := shell.Output{Truncated: r.StdoutTruncated}
+	if req.Cursor == "" {
+		output.Content = r.Stdout
+	} else if cursor, decodeErr := shell.DecodeCursor(req.Cursor); decodeErr != nil {
+		output.Content = r.Stdout
+		output.Resync = true
+	} else if suffix, ok := shell.Apply(cursor, id, pane, []byte(r.Stdout)); ok {
+		output.Content = string(suffix)
+	} else {
+		output.Content = r.Stdout
+		output.Resync = true
+	}
+	cursor, err := shell.EncodeCursor(id, pane, []byte(r.Stdout))
+	if err != nil {
+		return shell.Output{}, err
+	}
+	output.Cursor = cursor
+	return output, nil
 }
 
 func (b *Backend) Close(ctx context.Context, h host.Host, id string) error {
