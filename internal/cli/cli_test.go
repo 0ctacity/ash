@@ -201,6 +201,12 @@ func TestShellCLIListReadCloseAndInputLimit(t *testing.T) {
 	if code := run("shell", "read", "h", id, "--cursor", "abc", "--json"); code != 0 || r.cursor != "abc" || !strings.Contains(out.String(), `"cursor":"next-cursor"`) {
 		t.Fatalf("%d %q %q", code, out.String(), errout.String())
 	}
+	if code := run("shell", "wait", "h", id, "--until", "captured", "--timeout", "1s", "--json"); code != 0 || !strings.Contains(out.String(), `"matched":true`) {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	if code := run("shell", "wait", "h", id, "--until", "a", "--regex", "b"); code != 1 {
+		t.Fatal("accepted both matchers")
+	}
 	if code := Run(context.Background(), []string{"shell", "send", "h", id}, nil, shells, strings.NewReader(strings.Repeat("a", shell.MaxInputSize+1)), &out, &errout); code != 1 || r.input != "captured output" {
 		t.Fatalf("%d input mutated", code)
 	}

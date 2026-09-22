@@ -26,6 +26,7 @@ const Usage = `Usage:
   ash [--config PATH] shell list HOST
   ash [--config PATH] shell send HOST ID [INPUT]
   ash [--config PATH] shell read HOST ID [--cursor VALUE] [--json]
+  ash [--config PATH] shell wait HOST ID [--cursor VALUE] [--until TEXT|--regex EXPR] [--timeout 30s] [--json]
   ash [--config PATH] shell close HOST ID
   ash setup [AGENT] [--scope user|project] [--project DIR] [--print]
   ash [--config PATH] mcp
@@ -35,6 +36,7 @@ Quote remote ~/ paths to prevent your local shell from expanding them.
 With --stdin, ASH forwards up to 64 KiB from standard input to the command.
 Shell send reads stdin if INPUT is omitted. Include a newline to execute input.
 Shell read returns a terminal snapshot; pass --cursor from a previous --json read for output added since then.
+Shell wait blocks for new output or --until/--regex and never closes the shell on timeout.
 `
 
 func Run(ctx context.Context, args []string, s *service.Service, shells *service.ShellService, in io.Reader, out, errout io.Writer) int {

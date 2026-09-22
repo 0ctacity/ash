@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"ash/internal/host"
 	"ash/internal/policy"
@@ -55,8 +56,9 @@ func TestShellPolicyDeniesEveryOperationBeforeBackend(t *testing.T) {
 	_, e2 := s.List(ctx, "h")
 	e3 := s.Send(ctx, "h", id, "pwd\n")
 	_, e4 := s.Read(ctx, "h", id, "")
+	_, e6 := s.Wait(ctx, "h", id, shell.WaitRequest{Timeout: time.Second})
 	e5 := s.Close(ctx, "h", id)
-	for _, err := range []error{e1, e2, e3, e4, e5} {
+	for _, err := range []error{e1, e2, e3, e4, e5, e6} {
 		if !errors.Is(err, policy.ErrPermissionDenied) {
 			t.Fatalf("got %v", err)
 		}
@@ -102,6 +104,96 @@ func TestShellServiceUsesBackendAcrossInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type waitBackend struct {
+	shell.Backend
+	outputs []shell.Output
+	err     error
+	i       int
+	closes  int
+}
+
+func (b *waitBackend) Name() string { return "test" }
+func (b *waitBackend) Read(_ context.Context, _ host.Host, _ string, _ shell.ReadRequest) (shell.Output, error) {
+	if b.err != nil {
+		return shell.Output{}, b.err
+	}
+	if b.i >= len(b.outputs) {
+		return shell.Output{}, nil
+	}
+	out := b.outputs[b.i]
+	b.i++
+	return out, nil
+}
+func (b *waitBackend) Close(context.Context, host.Host, string) error { b.closes++; return nil }
+
+func waitService(b *waitBackend) *ShellService {
+	return NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), b)
+}
+
+func TestWaitReturnsOnNewOutput(t *testing.T) {
+	b := &waitBackend{outputs: []shell.Output{{Content: "hello", Cursor: "c1"}}}
+	result, err := waitService(b).Wait(context.Background(), "h", "sh_"+strings.Repeat("a", 32), shell.WaitRequest{Timeout: time.Second})
+	if err != nil || !result.Matched || result.Content != "hello" || result.Cursor != "c1" {
+		t.Fatalf("%+v %v", result, err)
+	}
+}
+
+func TestWaitMatchesAcrossChunks(t *testing.T) {
+	b := &waitBackend{outputs: []shell.Output{{Content: "fo", Cursor: "c1"}, {Content: "obar", Cursor: "c2"}}}
+	result, err := waitService(b).Wait(context.Background(), "h", "sh_"+strings.Repeat("a", 32), shell.WaitRequest{Literal: "foo", Timeout: time.Second})
+	if err != nil || !result.Matched || result.Content != "foobar" || result.Cursor != "c2" {
+		t.Fatalf("%+v %v", result, err)
+	}
+}
+
+func TestWaitRegexAndTimeout(t *testing.T) {
+	b := &waitBackend{outputs: []shell.Output{{Content: "err=42", Cursor: "c1"}}}
+	result, err := waitService(b).Wait(context.Background(), "h", "sh_"+strings.Repeat("a", 32), shell.WaitRequest{Regex: `err=\d+`, Timeout: time.Second})
+	if err != nil || !result.Matched {
+		t.Fatalf("%+v %v", result, err)
+	}
+	// No output and no matcher: returns on timeout without closing the shell.
+	empty := &waitBackend{}
+	result, err = waitService(empty).Wait(context.Background(), "h", "sh_"+strings.Repeat("a", 32), shell.WaitRequest{Timeout: 40 * time.Millisecond})
+	if err != nil || !result.TimedOut || result.Matched || empty.closes != 0 {
+		t.Fatalf("%+v %v closes=%d", result, err, empty.closes)
+	}
+}
+
+func TestWaitValidationAndClosure(t *testing.T) {
+	id := "sh_" + strings.Repeat("a", 32)
+	s := waitService(&waitBackend{})
+	if _, err := s.Wait(context.Background(), "h", id, shell.WaitRequest{Literal: "a", Regex: "a", Timeout: time.Second}); err == nil {
+		t.Fatal("accepted both matchers")
+	}
+	if _, err := s.Wait(context.Background(), "h", id, shell.WaitRequest{Regex: "(", Timeout: time.Second}); err == nil {
+		t.Fatal("accepted invalid regex")
+	}
+	if _, err := s.Wait(context.Background(), "h", id, shell.WaitRequest{}); err == nil {
+		t.Fatal("accepted zero timeout")
+	}
+	if _, err := s.Wait(context.Background(), "h", id, shell.WaitRequest{Timeout: MaxWaitTimeout + time.Second}); err == nil {
+		t.Fatal("accepted oversized timeout")
+	}
+	closed := waitService(&waitBackend{err: shell.ErrNotFound})
+	if _, err := closed.Wait(context.Background(), "h", id, shell.WaitRequest{Timeout: time.Second}); !errors.Is(err, shell.ErrNotFound) {
+		t.Fatalf("closure: %v", err)
+	}
+}
+
+func TestWaitCancellationDoesNotCloseShell(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b := &waitBackend{}
+	if _, err := waitService(b).Wait(ctx, "h", "sh_"+strings.Repeat("a", 32), shell.WaitRequest{Timeout: time.Minute}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("%v", err)
+	}
+	if b.closes != 0 {
+		t.Fatal("cancellation closed the shell")
+	}
+}
+
 func TestShellValidationAndCancellation(t *testing.T) {
 	backend := new(shellBackend)
 	s := NewShells(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), backend)
