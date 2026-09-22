@@ -25,6 +25,7 @@ const Usage = `Usage:
   ash [--config PATH] shell send HOST ID [INPUT]
   ash [--config PATH] shell read HOST ID
   ash [--config PATH] shell close HOST ID
+  ash setup [AGENT] [--scope user|project] [--project DIR] [--print]
   ash [--config PATH] mcp
 
 COMMAND is shell code executed through the remote user's shell.

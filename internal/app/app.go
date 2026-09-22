@@ -45,6 +45,13 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		return cli.Run(ctx, args, nil, nil, in, out, errout)
 	}
+	if args[0] == "setup" {
+		exe, err := os.Executable()
+		if err != nil {
+			return fail(err)
+		}
+		return cli.Setup(args[1:], exe, path, out, errout)
+	}
 	c, err := config.Load(path)
 	if err != nil {
 		return fail(err)

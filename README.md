@@ -117,6 +117,27 @@ Every shell operation requires the host's existing `exec` capability. No additio
 
 Control operations have a 30-second deadline. That deadline limits the control request, not the lifetime of the persistent shell or a command sent to it. Persistence covers ASH/SSH disconnects, not host reboots or termination of Zellij. Treat a canceled or failed send as potentially delivered; do not blindly retry commands with side effects.
 
+## Set up MCP with a coding agent
+
+`ash setup` registers ASH as a stdio MCP server using the absolute ASH executable path and your configuration file. Run it with the same `--config` value (if any) that you use for other commands:
+
+```sh
+./ash setup codex
+./ash setup opencode --scope project
+./ash setup freebuff --scope project
+./ash setup codex --print
+```
+
+| Agent | Scope | File |
+| --- | --- | --- |
+| Codex | user | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
+| Codex | project | `.codex/config.toml` |
+| OpenCode | user | `~/.config/opencode/opencode.json` |
+| OpenCode | project | `opencode.json` |
+| freebuff | project | `.agents/mcp.json` |
+
+Re-running setup updates the existing ASH entry in place instead of creating a duplicate, and leaves unrelated settings and comments untouched. `--print` shows the proposed configuration without writing any file. Restart the agent after setup so it reloads its configuration and starts the ASH server. Unsupported agents receive a clear diagnostic and a manual stdio configuration example.
+
 ## MCP
 
 Configure your MCP client to launch the built binary over stdio:
