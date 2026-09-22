@@ -68,6 +68,10 @@ Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH
 
 ```sh
 ./ash hosts
+./ash host add fedora --address 100.64.1.20 --user ata --exec --read --write
+./ash doctor
+./ash doctor fedora
+./ash doctor fedora --json
 ./ash exec fedora -- uname -a
 ./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
 printf '{"ok":true}' | ./ash exec fedora --stdin -- elephant receive
@@ -83,6 +87,10 @@ printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 ```
 
 `cwd` and environment values are escaped as literal values; environment names must be valid shell identifiers. Execution assumes a POSIX-compatible remote shell. Quote remote `~/` paths so your local shell does not expand them. SFTP resolves `~/` against its initial remote directory, normally the user's home.
+
+`host add` appends a minimal, deny-by-default entry to the configuration file. It never overwrites an existing host or an unparseable file; capabilities are granted explicitly with `--exec`, `--read`, and `--write`.
+
+`doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and Zellij availability as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
 
 Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts` and `stat` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Writes are not atomic and interruption may leave a partial file.
 
