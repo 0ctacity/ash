@@ -1,0 +1,9 @@
+[hosts.fedora]
+address = "fedora"
+user = "atawirtz"
+identity = "~/.ssh/id_ed25519"
+
+[hosts.fedora.policy]
+exec = true
+read = true
+write = true
