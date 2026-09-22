@@ -13,6 +13,11 @@ import (
 )
 
 func (t *Transport) files(ctx context.Context, h host.Host) (*sftp.Client, func(), error) {
+	if t.newSFTPDial != nil {
+		// Test seam: the SFTP client is provided directly instead of being
+		// opened over a dialed SSH connection.
+		return t.newSFTPDial(ctx, h)
+	}
 	client, cleanup, err := t.connect(ctx, h)
 	if err != nil {
 		return nil, nil, err

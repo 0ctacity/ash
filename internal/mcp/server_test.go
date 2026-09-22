@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestToolsAndDeniedExec(t *testing.T) {
 	}
 	defer cs.Close()
 	list, err := cs.ListTools(ctx, nil)
-	if err != nil || len(list.Tools) != 10 {
+	if err != nil || len(list.Tools) != 18 {
 		t.Fatalf("%+v %v", list, err)
 	}
 	res, err := cs.CallTool(ctx, &sdk.CallToolParams{Name: "ash_hosts", Arguments: map[string]any{}})
@@ -56,6 +57,48 @@ func (f *cancelTransport) Exec(ctx context.Context, _ host.Host, _ transport.Exe
 	close(f.canceled)
 	return transport.ExecResult{}, ctx.Err()
 }
+func TestDecodeContentTextAndBinary(t *testing.T) {
+	text := "hi"
+	if data, err := decodeContent(&text, nil); err != nil || string(data) != "hi" {
+		t.Fatalf("%q %v", data, err)
+	}
+	binary := base64.StdEncoding.EncodeToString([]byte{0xff, 0x00})
+	if data, err := decodeContent(nil, &binary); err != nil || len(data) != 2 || data[0] != 0xff {
+		t.Fatalf("%v %v", data, err)
+	}
+	if _, err := decodeContent(&text, &binary); err == nil {
+		t.Fatal("accepted both content fields")
+	}
+	bad := "!!!"
+	if _, err := decodeContent(nil, &bad); err == nil {
+		t.Fatal("accepted invalid base64")
+	}
+	if data, err := decodeContent(nil, nil); err != nil || data != nil {
+		t.Fatalf("%v %v", data, err)
+	}
+}
+
+func TestExecStdinFields(t *testing.T) {
+	text := "a\x00b"
+	if data, set, err := execStdin(execInput{Stdin: &text}); err != nil || !set || string(data) != text {
+		t.Fatalf("%q %v %v", data, set, err)
+	}
+	binary := base64.StdEncoding.EncodeToString([]byte{0xff, 0x00})
+	if data, set, err := execStdin(execInput{StdinB64: &binary}); err != nil || !set || len(data) != 2 || data[0] != 0xff {
+		t.Fatalf("%v %v %v", data, set, err)
+	}
+	if _, _, err := execStdin(execInput{Stdin: &text, StdinB64: &binary}); err == nil {
+		t.Fatal("accepted both stdin fields")
+	}
+	bad := "!!!"
+	if _, _, err := execStdin(execInput{StdinB64: &bad}); err == nil {
+		t.Fatal("accepted invalid base64")
+	}
+	if data, set, err := execStdin(execInput{}); err != nil || set || data != nil {
+		t.Fatalf("%v %v %v", data, set, err)
+	}
+}
+
 func TestClientCancellationReachesService(t *testing.T) {
 	ctx, cancelAll := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelAll()
@@ -95,7 +138,7 @@ func TestClientCancellationReachesService(t *testing.T) {
 
 type persistentBackend struct {
 	shell.Backend
-	id, input string
+	id, input, cursor string
 }
 
 func (b *persistentBackend) Name() string { return "test" }
@@ -113,8 +156,9 @@ func (b *persistentBackend) Send(_ context.Context, _ host.Host, id, input strin
 	b.input = input
 	return nil
 }
-func (b *persistentBackend) Read(context.Context, host.Host, string) (shell.Output, error) {
-	return shell.Output{Content: b.input}, nil
+func (b *persistentBackend) Read(_ context.Context, _ host.Host, _ string, req shell.ReadRequest) (shell.Output, error) {
+	b.cursor = req.Cursor
+	return shell.Output{Content: b.input, Cursor: "next"}, nil
 }
 func (b *persistentBackend) Close(context.Context, host.Host, string) error { b.id = ""; return nil }
 
@@ -166,6 +210,10 @@ func TestPersistentShellTools(t *testing.T) {
 	output := call("ash_shell_read", map[string]any{"host": "h", "shell_id": id})
 	if output["content"] != "pwd\n" || output["truncated"] != false {
 		t.Fatal(output)
+	}
+	waited := call("ash_shell_wait", map[string]any{"host": "h", "shell_id": id, "until": "pwd", "timeout_ms": 1000})
+	if waited["matched"] != true || waited["content"] != "pwd\n" {
+		t.Fatal(waited)
 	}
 	call("ash_shell_close", map[string]any{"host": "h", "shell_id": id})
 	list = call("ash_shell_list", map[string]any{"host": "h"})
