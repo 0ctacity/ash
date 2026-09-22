@@ -57,6 +57,41 @@ func (f *cancelTransport) Exec(ctx context.Context, _ host.Host, _ transport.Exe
 	close(f.canceled)
 	return transport.ExecResult{}, ctx.Err()
 }
+
+type argvTransport struct {
+	transport.Transport
+	argv []string
+}
+
+func (f *argvTransport) Exec(_ context.Context, _ host.Host, req transport.ExecRequest) (transport.ExecResult, error) {
+	f.argv = req.Argv
+	return transport.ExecResult{}, nil
+}
+
+func TestExecArgvTool(t *testing.T) {
+	ctx := context.Background()
+	tr := new(argvTransport)
+	server := New(service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), tr), nil)
+	st, ct := sdk.NewInMemoryTransports()
+	ss, err := server.Connect(ctx, st, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+	cs, err := sdk.NewClient(&sdk.Implementation{Name: "argv-test", Version: "1"}, nil).Connect(ctx, ct, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	res, err := cs.CallTool(ctx, &sdk.CallToolParams{Name: "ash_exec", Arguments: map[string]any{"host": "h", "argv": []any{"ls", "-la"}}})
+	if err != nil || res.IsError {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if len(tr.argv) != 2 || tr.argv[0] != "ls" || tr.argv[1] != "-la" {
+		t.Fatalf("%v", tr.argv)
+	}
+}
+
 func TestDecodeContentTextAndBinary(t *testing.T) {
 	text := "hi"
 	if data, err := decodeContent(&text, nil); err != nil || string(data) != "hi" {

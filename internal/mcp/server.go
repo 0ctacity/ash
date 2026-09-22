@@ -20,7 +20,8 @@ type hostsResult struct {
 }
 type execInput struct {
 	Host      string            `json:"host"`
-	Command   string            `json:"command" jsonschema:"Shell code executed through the remote user's shell"`
+	Command   string            `json:"command,omitempty" jsonschema:"Shell code executed through the remote user's shell. Mutually exclusive with argv."`
+	Argv      []string          `json:"argv,omitempty" jsonschema:"Structured program and arguments. Executed without a shell, so executable restrictions are enforceable. Mutually exclusive with command."`
 	Cwd       string            `json:"cwd,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
 	TimeoutMS int64             `json:"timeout_ms,omitempty"`
@@ -140,7 +141,7 @@ func New(s *service.Service, shells *service.ShellService) *sdk.Server {
 		if err != nil {
 			return nil, execOutput{}, err
 		}
-		r, err := s.Exec(ctx, transport.ExecRequest{Host: in.Host, Command: in.Command, Cwd: in.Cwd, Env: in.Env, Timeout: timeout, Stdin: stdin, StdinSet: stdinSet})
+		r, err := s.Exec(ctx, transport.ExecRequest{Host: in.Host, Command: in.Command, Argv: in.Argv, Cwd: in.Cwd, Env: in.Env, Timeout: timeout, Stdin: stdin, StdinSet: stdinSet})
 		return nil, execOutput{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr, StdoutTruncated: r.StdoutTruncated, StderrTruncated: r.StderrTruncated, DurationMS: r.Duration.Milliseconds()}, err
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_read", Description: "Read up to 4 MiB using SFTP. Returns UTF-8 content by default, or base64 when encoding is \"base64\"."}, func(ctx context.Context, _ *sdk.CallToolRequest, in readInput) (*sdk.CallToolResult, readOutput, error) {

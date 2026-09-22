@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"ash/internal/audit"
 	"ash/internal/host"
 	"ash/internal/shell"
 	"ash/internal/transport"
@@ -43,6 +44,7 @@ type ShellService struct {
 	hosts          *host.Registry
 	backends       map[string]shell.Backend
 	defaultBackend string
+	audit          *audit.Recorder
 }
 
 func NewShells(hosts *host.Registry, backend shell.Backend) *ShellService {
@@ -78,13 +80,32 @@ func (s *ShellService) backendFor(h host.Host) (shell.Backend, error) {
 	return backend, nil
 }
 
+// WithAudit attaches one audit recorder to the shell service.
+func (s *ShellService) WithAudit(recorder *audit.Recorder) *ShellService {
+	s.audit = recorder
+	return s
+}
+
+func (s *ShellService) finish(operation, name string, started time.Time, err error) {
+	if s.audit == nil {
+		return
+	}
+	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds()}
+	if err != nil {
+		record.Result = audit.ResultError
+	}
+	s.audit.Record(record)
+}
+
 func (s *ShellService) resolve(ctx context.Context, name string) (host.Host, error) {
 	h, err := s.hosts.Get(name)
 	if err != nil {
 		return h, err
 	}
 	if err = h.Policy.Check("exec"); err != nil {
-		return h, fmt.Errorf("host %q: shell: %w", name, err)
+		err = fmt.Errorf("host %q: shell: %w", name, err)
+		s.audit.Record(audit.Record{Operation: "shell", Host: name, Decision: audit.Denied, Result: audit.ResultError})
+		return h, err
 	}
 	if err = ctx.Err(); err != nil {
 		return h, operationError(ctx, name, "shell", err)
@@ -96,7 +117,9 @@ func (s *ShellService) info(backend shell.Backend, name, id string) shell.Info {
 	return shell.Info{ID: id, Host: name, Backend: backend.Name()}
 }
 
-func (s *ShellService) Create(ctx context.Context, name, cwd string) (shell.Info, error) {
+func (s *ShellService) Create(ctx context.Context, name, cwd string) (info shell.Info, err error) {
+	started := time.Now()
+	defer func() { s.finish("shell create", name, started, err) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.Info{}, err
@@ -121,7 +144,9 @@ func (s *ShellService) Create(ctx context.Context, name, cwd string) (shell.Info
 	return s.info(backend, name, id), nil
 }
 
-func (s *ShellService) List(ctx context.Context, name string) ([]shell.Info, error) {
+func (s *ShellService) List(ctx context.Context, name string) (out []shell.Info, err error) {
+	started := time.Now()
+	defer func() { s.finish("shell list", name, started, err) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return nil, err
@@ -137,14 +162,16 @@ func (s *ShellService) List(ctx context.Context, name string) ([]shell.Info, err
 		return nil, operationError(ctx, name, "shell list", err)
 	}
 	sort.Strings(ids)
-	out := make([]shell.Info, 0, len(ids))
+	out = make([]shell.Info, 0, len(ids))
 	for _, id := range ids {
 		out = append(out, s.info(backend, name, id))
 	}
 	return out, nil
 }
 
-func (s *ShellService) Send(ctx context.Context, name, id, input string) error {
+func (s *ShellService) Send(ctx context.Context, name, id, input string) (err error) {
+	started := time.Now()
+	defer func() { s.finish("shell send", name, started, err) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return err
@@ -167,7 +194,9 @@ func (s *ShellService) Send(ctx context.Context, name, id, input string) error {
 	return operationError(ctx, name, "shell send", backend.Send(ctx, h, id, input))
 }
 
-func (s *ShellService) Read(ctx context.Context, name, id, cursor string) (shell.Output, error) {
+func (s *ShellService) Read(ctx context.Context, name, id, cursor string) (out shell.Output, err error) {
+	started := time.Now()
+	defer func() { s.finish("shell read", name, started, err) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.Output{}, err
@@ -184,13 +213,19 @@ func (s *ShellService) Read(ctx context.Context, name, id, cursor string) (shell
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
-	output, err := backend.Read(ctx, h, id, shell.ReadRequest{Cursor: cursor})
-	return output, operationError(ctx, name, "shell read", err)
+	out, err = backend.Read(ctx, h, id, shell.ReadRequest{Cursor: cursor})
+	// Backend errors carry no bound fields here; report the resolved error.
+	if err != nil {
+		return out, operationError(ctx, name, "shell read", err)
+	}
+	return out, nil
 }
 
 // Wait polls for new output or a matcher without closing the shell on timeout.
 // It accumulates only bounded new output and matches across chunk boundaries.
-func (s *ShellService) Wait(ctx context.Context, name, id string, req shell.WaitRequest) (shell.WaitResult, error) {
+func (s *ShellService) Wait(ctx context.Context, name, id string, req shell.WaitRequest) (result shell.WaitResult, err error) {
+	started := time.Now()
+	defer func() { s.finish("shell wait", name, started, err) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return shell.WaitResult{}, err
@@ -221,7 +256,7 @@ func (s *ShellService) Wait(ctx context.Context, name, id string, req shell.Wait
 	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 
-	result := shell.WaitResult{Cursor: req.Cursor}
+	result = shell.WaitResult{Cursor: req.Cursor}
 	accumulated := make([]byte, 0, 4096)
 	interval := minWaitPoll
 	for {
@@ -284,7 +319,9 @@ func matchWait(req shell.WaitRequest, matcher *regexp.Regexp, accumulated []byte
 	}
 }
 
-func (s *ShellService) Close(ctx context.Context, name, id string) error {
+func (s *ShellService) Close(ctx context.Context, name, id string) (err error) {
+	started := time.Now()
+	defer func() { s.finish("shell close", name, started, err) }()
 	h, err := s.resolve(ctx, name)
 	if err != nil {
 		return err

@@ -35,6 +35,12 @@ type ExecRequest struct {
 	Host, Command, Cwd string
 	Env                map[string]string
 	Timeout            time.Duration
+	// Argv, when non-empty, is executed as structured program arguments with
+	// strict POSIX quoting instead of shell code. Command and Argv are
+	// mutually exclusive.
+	Argv []string
+	// MaxOutput caps each captured stream when smaller than MaxOutputSize.
+	MaxOutput int
 	// Stdin is bounded binary input forwarded to the remote process. StdinSet
 	// distinguishes an explicit empty input from no input at all.
 	Stdin    []byte
@@ -79,6 +85,7 @@ type Transport interface {
 	Read(context.Context, host.Host, string) ([]byte, error)
 	Write(context.Context, host.Host, string, []byte) error
 	Stat(context.Context, host.Host, string) (FileInfo, error)
+	Canonicalize(context.Context, host.Host, string) (string, error)
 	List(context.Context, host.Host, string) ([]DirEntry, error)
 	Mkdir(context.Context, host.Host, string) error
 	Rename(context.Context, host.Host, string, string) error

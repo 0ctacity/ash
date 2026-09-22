@@ -11,6 +11,7 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"ash/internal/audit"
 	"ash/internal/cli"
 	"ash/internal/config"
 	"ash/internal/doctor"
@@ -90,6 +91,14 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	shells := service.NewShellsWithBackends(hosts, zellij.New(t), tmux.New(t))
 	if args[0] == "doctor" {
 		return cli.Doctor(ctx, args[1:], doctor.New(hosts, t, filepath.Join(home, ".ssh", "known_hosts")), out, errout)
+	}
+	if c.AuditLog != "" {
+		recorder, err := audit.New(c.AuditLog)
+		if err != nil {
+			return fail(err)
+		}
+		s.WithAudit(recorder)
+		shells.WithAudit(recorder)
 	}
 	if args[0] == "mcp" {
 		if len(args) != 1 {
