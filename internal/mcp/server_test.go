@@ -32,7 +32,7 @@ func TestToolsAndDeniedExec(t *testing.T) {
 	}
 	defer cs.Close()
 	list, err := cs.ListTools(ctx, nil)
-	if err != nil || len(list.Tools) != 17 {
+	if err != nil || len(list.Tools) != 18 {
 		t.Fatalf("%+v %v", list, err)
 	}
 	res, err := cs.CallTool(ctx, &sdk.CallToolParams{Name: "ash_hosts", Arguments: map[string]any{}})
