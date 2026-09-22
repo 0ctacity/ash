@@ -83,6 +83,18 @@ func TestDoctorCommandTextAndJSON(t *testing.T) {
 	}
 }
 
+func TestSetupCommandParsing(t *testing.T) {
+	var out, errout bytes.Buffer
+	if code := Setup(nil, "/usr/bin/ash", "/tmp/config.toml", &out, &errout); code != 0 || !strings.Contains(out.String(), "codex") || !strings.Contains(out.String(), "freebuff") {
+		t.Fatalf("%d %q %q", code, out.String(), errout.String())
+	}
+	out.Reset()
+	errout.Reset()
+	if code := Setup([]string{"claude"}, "/usr/bin/ash", "/tmp/config.toml", &out, &errout); code != 1 || !strings.Contains(errout.String(), "Manual configuration example") {
+		t.Fatalf("%d %q", code, errout.String())
+	}
+}
+
 func TestExecStdinFlag(t *testing.T) {
 	r := new(recorder)
 	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), r)
