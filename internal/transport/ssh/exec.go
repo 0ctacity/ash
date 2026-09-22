@@ -19,9 +19,11 @@ func QuoteShell(value string) string { return "'" + strings.ReplaceAll(value, "'
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-func buildCommand(req transport.ExecRequest) (string, error) {
-	if strings.ContainsRune(req.Command, 0) || strings.ContainsRune(req.Cwd, 0) {
-		return "", fmt.Errorf("command and cwd must not contain NUL")
+// buildPreamble renders environment exports and the optional cwd change shared
+// by shell-code and argv execution.
+func buildPreamble(req transport.ExecRequest) (string, error) {
+	if strings.ContainsRune(req.Cwd, 0) {
+		return "", fmt.Errorf("cwd must not contain NUL")
 	}
 	var b strings.Builder
 	keys := make([]string, 0, len(req.Env))
@@ -45,8 +47,38 @@ func buildCommand(req transport.ExecRequest) (string, error) {
 		}
 		fmt.Fprintf(&b, "cd -- %s || exit\n", cwd)
 	}
-	b.WriteString(req.Command)
 	return b.String(), nil
+}
+
+func buildCommand(req transport.ExecRequest) (string, error) {
+	if strings.ContainsRune(req.Command, 0) {
+		return "", fmt.Errorf("command must not contain NUL")
+	}
+	preamble, err := buildPreamble(req)
+	if err != nil {
+		return "", err
+	}
+	return preamble + req.Command, nil
+}
+
+// buildArgv quotes structured arguments as literal POSIX words. No shell
+// interpretation is possible, so program restrictions cannot be bypassed.
+func buildArgv(req transport.ExecRequest) (string, error) {
+	if len(req.Argv) == 0 {
+		return "", fmt.Errorf("argv must not be empty")
+	}
+	preamble, err := buildPreamble(req)
+	if err != nil {
+		return "", err
+	}
+	parts := make([]string, 0, len(req.Argv))
+	for _, arg := range req.Argv {
+		if strings.ContainsRune(arg, 0) {
+			return "", fmt.Errorf("argv must not contain NUL")
+		}
+		parts = append(parts, QuoteShell(arg))
+	}
+	return preamble + strings.Join(parts, " "), nil
 }
 
 type limitedBuffer struct {
@@ -71,7 +103,12 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecRequest) (result transport.ExecResult, err error) {
 	started := time.Now()
 	defer func() { result.Duration = time.Since(started) }()
-	command, err := buildCommand(req)
+	var command string
+	if len(req.Argv) > 0 {
+		command, err = buildArgv(req)
+	} else {
+		command, err = buildCommand(req)
+	}
 	if err != nil {
 		return result, err
 	}
@@ -91,10 +128,26 @@ func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecReq
 		return result, operationError(ctx, err)
 	}
 	defer session.Close()
-	stdout := limitedBuffer{limit: transport.MaxOutputSize}
-	stderr := limitedBuffer{limit: transport.MaxOutputSize}
+	if req.StdinSet {
+		if len(req.Stdin) > transport.MaxExecInputSize {
+			return result, transport.ErrInputTooLarge
+		}
+		// A bytes.Reader sends EOF after the payload, so the remote stdin stream
+		// closes even when the process expects input until end of file.
+		session.Stdin = bytes.NewReader(req.Stdin)
+	}
+	limit := transport.MaxOutputSize
+	if req.MaxOutput > 0 && req.MaxOutput < limit {
+		limit = req.MaxOutput
+	}
+	stdout := limitedBuffer{limit: limit}
+	stderr := limitedBuffer{limit: limit}
 	session.Stdout = &stdout
 	session.Stderr = &stderr
+	// Close the channel when the context ends so a stalled stdin write or a
+	// hung remote process cannot keep Run blocked past cancellation.
+	stop := context.AfterFunc(ctx, func() { session.Close() })
+	defer stop()
 	err = session.Run(command)
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()

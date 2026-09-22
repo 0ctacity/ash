@@ -14,6 +14,9 @@ import (
 
 type Config struct {
 	Hosts map[string]host.Host `toml:"hosts"`
+	// AuditLog, when set, records structured operation metadata to this local
+	// owner-only JSONL file.
+	AuditLog string `toml:"audit_log"`
 }
 
 func Parse(data []byte) (Config, error) {
@@ -41,8 +44,19 @@ func Parse(data []byte) (Config, error) {
 		if h.Port != 0 && (h.Port < 1 || h.Port > 65535) {
 			return c, fmt.Errorf("host %q: invalid port %d", name, h.Port)
 		}
+		if err := h.Policy.Validate(); err != nil {
+			return c, fmt.Errorf("host %q: %w", name, err)
+		}
+		switch h.ShellBackend {
+		case "", "zellij", "tmux":
+		default:
+			return c, fmt.Errorf("host %q: shell_backend must be zellij or tmux", name)
+		}
 		h.Name = name
 		c.Hosts[name] = h
+	}
+	if strings.ContainsRune(c.AuditLog, 0) {
+		return c, fmt.Errorf("audit_log must not contain NUL")
 	}
 	return c, nil
 }

@@ -3,10 +3,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 	"unicode/utf8"
 
+	"ash/internal/audit"
 	"ash/internal/host"
 	"ash/internal/transport"
 )
@@ -14,10 +16,17 @@ import (
 type Service struct {
 	hosts     *host.Registry
 	transport transport.Transport
+	audit     *audit.Recorder
 }
 
 func New(hosts *host.Registry, t transport.Transport) *Service {
 	return &Service{hosts: hosts, transport: t}
+}
+
+// WithAudit attaches one audit recorder to the service.
+func (s *Service) WithAudit(recorder *audit.Recorder) *Service {
+	s.audit = recorder
+	return s
 }
 
 type HostInfo struct {
@@ -44,6 +53,7 @@ func (s *Service) Hosts() []HostInfo {
 	}
 	return out
 }
+
 func (s *Service) resolve(name, operation string) (host.Host, error) {
 	h, err := s.hosts.Get(name)
 	if err != nil {
@@ -54,6 +64,51 @@ func (s *Service) resolve(name, operation string) (host.Host, error) {
 	}
 	return h, nil
 }
+
+// authorize resolves a host and records refusals.
+func (s *Service) authorize(name, operation string) (host.Host, error) {
+	h, err := s.resolve(name, operation)
+	if err != nil {
+		s.audit.Record(audit.Record{Operation: operation, Host: name, Decision: audit.Denied, Result: audit.ResultError})
+	}
+	return h, err
+}
+
+func (s *Service) finish(operation, name string, started time.Time, err error) {
+	if s.audit == nil {
+		return
+	}
+	record := audit.Record{Operation: operation, Host: name, Decision: audit.Allowed, Result: audit.ResultOK, DurationMS: time.Since(started).Milliseconds()}
+	if err != nil {
+		record.Result = audit.ResultError
+		if errors.Is(err, transport.ErrTimeout) {
+			record.Result = audit.ResultTimeout
+		}
+	}
+	s.audit.Record(record)
+}
+
+func (s *Service) fail(operation, name string, started time.Time, err error) error {
+	s.finish(operation, name, started, err)
+	return err
+}
+
+// enforceRoots canonicalizes a remote path and checks it against policy roots.
+// It performs no extra round trip when the host is unconstrained.
+func (s *Service) enforceRoots(ctx context.Context, h host.Host, name, operation, p string, write bool) error {
+	if !h.Policy.HasRoots(write) {
+		return nil
+	}
+	canonical, err := s.transport.Canonicalize(ctx, h, p)
+	if err != nil {
+		return operationError(ctx, name, operation, err)
+	}
+	if err := h.Policy.CheckRoots(canonical, write); err != nil {
+		return fmt.Errorf("host %q: %s: %w", name, operation, err)
+	}
+	return nil
+}
+
 func operationError(ctx context.Context, name, op string, err error) error {
 	if err == nil {
 		return nil
@@ -66,77 +121,307 @@ func operationError(ctx context.Context, name, op string, err error) error {
 	}
 	return fmt.Errorf("host %q: %s: %w", name, op, err)
 }
+
 func (s *Service) Exec(ctx context.Context, req transport.ExecRequest) (transport.ExecResult, error) {
-	h, err := s.resolve(req.Host, "exec")
+	started := time.Now()
+	h, err := s.authorize(req.Host, "exec")
 	if err != nil {
 		return transport.ExecResult{}, err
 	}
-	if req.Command == "" {
+	result, err := s.exec(ctx, h, req)
+	s.finish("exec", req.Host, started, err)
+	return result, err
+}
+
+func (s *Service) exec(ctx context.Context, h host.Host, req transport.ExecRequest) (transport.ExecResult, error) {
+	name := req.Host
+	argv := len(req.Argv) > 0
+	switch {
+	case argv && req.Command != "":
+		return transport.ExecResult{}, fmt.Errorf("command and argv are mutually exclusive")
+	case !argv && req.Command == "":
 		return transport.ExecResult{}, fmt.Errorf("command must not be empty")
+	}
+	if argv {
+		if req.Argv[0] == "" {
+			return transport.ExecResult{}, fmt.Errorf("argv program must not be empty")
+		}
+		if err := h.Policy.CheckExecutable(req.Argv[0]); err != nil {
+			return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
+		}
+	} else if err := h.Policy.CheckShell(); err != nil {
+		return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
+	}
+	if len(req.Stdin) > transport.MaxExecInputSize {
+		return transport.ExecResult{}, fmt.Errorf("exec input exceeds %d byte limit", transport.MaxExecInputSize)
+	}
+	if err := h.Policy.CheckInput(len(req.Stdin)); err != nil {
+		return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
 	}
 	if req.Timeout < 0 {
 		return transport.ExecResult{}, fmt.Errorf("timeout must be positive")
 	}
+	if h.Policy.MaxOutputBytes > 0 {
+		req.MaxOutput = int(h.Policy.MaxOutputBytes)
+	}
 	if req.Timeout == 0 {
 		req.Timeout = transport.DefaultExecTimeout
+	}
+	if limit := h.Policy.MaxTimeout(); limit > 0 && req.Timeout > limit {
+		req.Timeout = limit
 	}
 	ctx, cancel := context.WithTimeout(ctx, req.Timeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return transport.ExecResult{}, operationError(ctx, req.Host, "exec", err)
+		return transport.ExecResult{}, operationError(ctx, name, "exec", err)
+	}
+	if req.Cwd != "" && len(h.Policy.CwdRoots) > 0 {
+		canonical, err := s.transport.Canonicalize(ctx, h, req.Cwd)
+		if err != nil {
+			return transport.ExecResult{}, operationError(ctx, name, "exec", err)
+		}
+		if err := h.Policy.CheckCwd(canonical); err != nil {
+			return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
+		}
 	}
 	result, err := s.transport.Exec(ctx, h, req)
-	return result, operationError(ctx, req.Host, "exec", err)
+	return result, operationError(ctx, name, "exec", err)
 }
+
 func (s *Service) Read(ctx context.Context, name, path string) ([]byte, error) {
-	h, err := s.resolve(name, "read")
+	started := time.Now()
+	h, err := s.authorize(name, "read")
 	if err != nil {
 		return nil, err
 	}
 	if path == "" {
-		return nil, fmt.Errorf("path must not be empty")
+		return nil, s.fail("read", name, started, fmt.Errorf("path must not be empty"))
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return nil, operationError(ctx, name, "read", err)
+		return nil, s.fail("read", name, started, operationError(ctx, name, "read", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "read", path, false); err != nil {
+		return nil, s.fail("read", name, started, err)
 	}
 	data, err := s.transport.Read(ctx, h, path)
-	return data, operationError(ctx, name, "read", err)
+	err = operationError(ctx, name, "read", err)
+	s.finish("read", name, started, err)
+	return data, err
 }
+
 func (s *Service) Write(ctx context.Context, name, path string, data []byte) error {
-	h, err := s.resolve(name, "write")
+	started := time.Now()
+	h, err := s.authorize(name, "write")
 	if err != nil {
 		return err
 	}
 	if path == "" {
-		return fmt.Errorf("path must not be empty")
+		return s.fail("write", name, started, fmt.Errorf("path must not be empty"))
 	}
 	if len(data) > transport.MaxWriteSize {
-		return fmt.Errorf("write exceeds %d byte limit", transport.MaxWriteSize)
+		return s.fail("write", name, started, fmt.Errorf("write exceeds %d byte limit", transport.MaxWriteSize))
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return operationError(ctx, name, "write", err)
+		return s.fail("write", name, started, operationError(ctx, name, "write", err))
 	}
-	return operationError(ctx, name, "write", s.transport.Write(ctx, h, path, data))
+	if err := s.enforceRoots(ctx, h, name, "write", path, true); err != nil {
+		return s.fail("write", name, started, err)
+	}
+	err = operationError(ctx, name, "write", s.transport.Write(ctx, h, path, data))
+	s.finish("write", name, started, err)
+	return err
 }
+
 func (s *Service) Stat(ctx context.Context, name, path string) (transport.FileInfo, error) {
-	h, err := s.resolve(name, "stat")
+	started := time.Now()
+	h, err := s.authorize(name, "stat")
 	if err != nil {
 		return transport.FileInfo{}, err
 	}
 	if path == "" {
-		return transport.FileInfo{}, fmt.Errorf("path must not be empty")
+		return transport.FileInfo{}, s.fail("stat", name, started, fmt.Errorf("path must not be empty"))
 	}
 	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return transport.FileInfo{}, operationError(ctx, name, "stat", err)
+		return transport.FileInfo{}, s.fail("stat", name, started, operationError(ctx, name, "stat", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "stat", path, false); err != nil {
+		return transport.FileInfo{}, s.fail("stat", name, started, err)
 	}
 	result, err := s.transport.Stat(ctx, h, path)
-	return result, operationError(ctx, name, "stat", err)
+	err = operationError(ctx, name, "stat", err)
+	s.finish("stat", name, started, err)
+	return result, err
+}
+
+func (s *Service) List(ctx context.Context, name, p string) ([]transport.DirEntry, error) {
+	started := time.Now()
+	h, err := s.authorize(name, "read")
+	if err != nil {
+		return nil, err
+	}
+	if p == "" {
+		return nil, s.fail("list", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, s.fail("list", name, started, operationError(ctx, name, "list", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "list", p, false); err != nil {
+		return nil, s.fail("list", name, started, err)
+	}
+	entries, err := s.transport.List(ctx, h, p)
+	err = operationError(ctx, name, "list", err)
+	s.finish("list", name, started, err)
+	return entries, err
+}
+
+func (s *Service) Mkdir(ctx context.Context, name, p string) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if p == "" {
+		return s.fail("mkdir", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("mkdir", name, started, operationError(ctx, name, "mkdir", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "mkdir", p, true); err != nil {
+		return s.fail("mkdir", name, started, err)
+	}
+	err = operationError(ctx, name, "mkdir", s.transport.Mkdir(ctx, h, p))
+	s.finish("mkdir", name, started, err)
+	return err
+}
+
+func (s *Service) Rename(ctx context.Context, name, from, to string) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if from == "" || to == "" {
+		return s.fail("rename", name, started, fmt.Errorf("source and destination must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("rename", name, started, operationError(ctx, name, "rename", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "rename", from, true); err != nil {
+		return s.fail("rename", name, started, err)
+	}
+	if err := s.enforceRoots(ctx, h, name, "rename", to, true); err != nil {
+		return s.fail("rename", name, started, err)
+	}
+	err = operationError(ctx, name, "rename", s.transport.Rename(ctx, h, from, to))
+	s.finish("rename", name, started, err)
+	return err
+}
+
+func (s *Service) Remove(ctx context.Context, name, p string) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if p == "" {
+		return s.fail("remove", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("remove", name, started, operationError(ctx, name, "remove", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "remove", p, true); err != nil {
+		return s.fail("remove", name, started, err)
+	}
+	err = operationError(ctx, name, "remove", s.transport.Remove(ctx, h, p))
+	s.finish("remove", name, started, err)
+	return err
+}
+
+// AtomicWrite replaces a remote file completely or leaves the prior file intact.
+func (s *Service) AtomicWrite(ctx context.Context, name, p string, data []byte) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if p == "" {
+		return s.fail("write atomic", name, started, fmt.Errorf("path must not be empty"))
+	}
+	if len(data) > transport.MaxWriteSize {
+		return s.fail("write atomic", name, started, fmt.Errorf("write exceeds %d byte limit", transport.MaxWriteSize))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("write atomic", name, started, operationError(ctx, name, "write atomic", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "write atomic", p, true); err != nil {
+		return s.fail("write atomic", name, started, err)
+	}
+	err = operationError(ctx, name, "write atomic", s.transport.AtomicWrite(ctx, h, p, data))
+	s.finish("write atomic", name, started, err)
+	return err
+}
+
+// ReadTree returns a bounded, symlink-free tree rooted at a remote directory.
+func (s *Service) ReadTree(ctx context.Context, name, p string) ([]transport.TreeEntry, error) {
+	started := time.Now()
+	h, err := s.authorize(name, "read")
+	if err != nil {
+		return nil, err
+	}
+	if p == "" {
+		return nil, s.fail("download", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, s.fail("download", name, started, operationError(ctx, name, "download", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "download", p, false); err != nil {
+		return nil, s.fail("download", name, started, err)
+	}
+	entries, err := s.transport.ReadTree(ctx, h, p)
+	err = operationError(ctx, name, "download", err)
+	s.finish("download", name, started, err)
+	return entries, err
+}
+
+// WriteTree validates and uploads a bounded tree rooted at a remote directory.
+func (s *Service) WriteTree(ctx context.Context, name, p string, entries []transport.TreeEntry) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if err := transport.ValidateTree(p, entries); err != nil {
+		return s.fail("upload", name, started, err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("upload", name, started, operationError(ctx, name, "upload", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "upload", p, true); err != nil {
+		return s.fail("upload", name, started, err)
+	}
+	err = operationError(ctx, name, "upload", s.transport.WriteTree(ctx, h, p, entries))
+	s.finish("upload", name, started, err)
+	return err
 }
 
 // Text rejects binary data rather than silently replacing invalid UTF-8 in JSON.

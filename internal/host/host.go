@@ -11,13 +11,14 @@ import (
 var ErrHostNotFound = errors.New("host not found")
 
 type Host struct {
-	Name     string        `toml:"-"`
-	Address  string        `toml:"address"`
-	Port     int           `toml:"port"`
-	User     string        `toml:"user"`
-	Identity string        `toml:"identity"`
-	SSHAlias string        `toml:"ssh_alias"`
-	Policy   policy.Policy `toml:"policy"`
+	Name         string        `toml:"-"`
+	Address      string        `toml:"address"`
+	Port         int           `toml:"port"`
+	User         string        `toml:"user"`
+	Identity     string        `toml:"identity"`
+	SSHAlias     string        `toml:"ssh_alias"`
+	ShellBackend string        `toml:"shell_backend"`
+	Policy       policy.Policy `toml:"policy"`
 
 	// Resolved from an OpenSSH alias at startup. They are never exposed through
 	// `ash hosts` and are not part of the configuration file.

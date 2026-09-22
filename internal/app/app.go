@@ -11,11 +11,14 @@ import (
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"ash/internal/audit"
 	"ash/internal/cli"
 	"ash/internal/config"
+	"ash/internal/doctor"
 	"ash/internal/host"
 	ashmcp "ash/internal/mcp"
 	"ash/internal/service"
+	"ash/internal/shell/tmux"
 	"ash/internal/shell/zellij"
 	"ash/internal/sshconfig"
 	sshtransport "ash/internal/transport/ssh"
@@ -46,6 +49,19 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		return cli.Run(ctx, args, nil, nil, in, out, errout)
 	}
+	if args[0] == "host" {
+		if len(args) < 2 || args[1] != "add" {
+			return fail(fmt.Errorf("usage: ash [--config PATH] host add NAME --address ADDRESS --user USER"))
+		}
+		return cli.HostAdd(args[2:], path, out, errout)
+	}
+	if args[0] == "setup" {
+		exe, err := os.Executable()
+		if err != nil {
+			return fail(err)
+		}
+		return cli.Setup(args[1:], exe, path, out, errout)
+	}
 	c, err := config.Load(path)
 	if err != nil {
 		return fail(err)
@@ -73,7 +89,18 @@ func Run(ctx context.Context, args []string, in io.Reader, out, errout io.Writer
 	defer t.Close()
 	hosts := host.New(c.Hosts)
 	s := service.New(hosts, t)
-	shells := service.NewShells(hosts, zellij.New(t))
+	shells := service.NewShellsWithBackends(hosts, zellij.New(t), tmux.New(t))
+	if args[0] == "doctor" {
+		return cli.Doctor(ctx, args[1:], doctor.New(hosts, t, filepath.Join(home, ".ssh", "known_hosts")), out, errout)
+	}
+	if c.AuditLog != "" {
+		recorder, err := audit.New(c.AuditLog)
+		if err != nil {
+			return fail(err)
+		}
+		s.WithAudit(recorder)
+		shells.WithAudit(recorder)
+	}
 	if args[0] == "mcp" {
 		if len(args) != 1 {
 			return fail(fmt.Errorf("mcp takes no arguments"))
