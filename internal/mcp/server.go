@@ -3,6 +3,8 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
+	"fmt"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -22,6 +24,8 @@ type execInput struct {
 	Cwd       string            `json:"cwd,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
 	TimeoutMS int64             `json:"timeout_ms,omitempty"`
+	Stdin     *string           `json:"stdin,omitempty" jsonschema:"UTF-8 text forwarded to the remote process stdin, at most 64 KiB. Set it to an empty string to send empty input."`
+	StdinB64  *string           `json:"stdin_base64,omitempty" jsonschema:"Base64-encoded binary forwarded to the remote process stdin, at most 64 KiB. Mutually exclusive with stdin."`
 }
 type execOutput struct {
 	ExitCode        int    `json:"exit_code"`
@@ -48,6 +52,24 @@ type writeOutput struct {
 	Size int `json:"size"`
 }
 
+// execStdin resolves the mutually exclusive text and binary stdin fields.
+func execStdin(in execInput) ([]byte, bool, error) {
+	if in.Stdin != nil && in.StdinB64 != nil {
+		return nil, false, fmt.Errorf("provide only one of stdin or stdin_base64")
+	}
+	if in.Stdin != nil {
+		return []byte(*in.Stdin), true, nil
+	}
+	if in.StdinB64 != nil {
+		data, err := base64.StdEncoding.DecodeString(*in.StdinB64)
+		if err != nil {
+			return nil, false, fmt.Errorf("stdin_base64 is not valid base64: %w", err)
+		}
+		return data, true, nil
+	}
+	return nil, false, nil
+}
+
 func New(s *service.Service, shells *service.ShellService) *sdk.Server {
 	server := sdk.NewServer(&sdk.Implementation{Name: "ash", Version: Version}, nil)
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_hosts", Description: "List configured hosts and granted capabilities."}, func(ctx context.Context, _ *sdk.CallToolRequest, _ struct{}) (*sdk.CallToolResult, hostsResult, error) {
@@ -58,7 +80,11 @@ func New(s *service.Service, shells *service.ShellService) *sdk.Server {
 		if err != nil {
 			return nil, execOutput{}, err
 		}
-		r, err := s.Exec(ctx, transport.ExecRequest{Host: in.Host, Command: in.Command, Cwd: in.Cwd, Env: in.Env, Timeout: timeout})
+		stdin, stdinSet, err := execStdin(in)
+		if err != nil {
+			return nil, execOutput{}, err
+		}
+		r, err := s.Exec(ctx, transport.ExecRequest{Host: in.Host, Command: in.Command, Cwd: in.Cwd, Env: in.Env, Timeout: timeout, Stdin: stdin, StdinSet: stdinSet})
 		return nil, execOutput{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr, StdoutTruncated: r.StdoutTruncated, StderrTruncated: r.StderrTruncated, DurationMS: r.Duration.Milliseconds()}, err
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_read", Description: "Read up to 4 MiB of UTF-8 text using SFTP."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, readOutput, error) {

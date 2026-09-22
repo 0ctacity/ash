@@ -68,8 +68,13 @@ Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH
 
 ```sh
 ./ash hosts
+./ash host add fedora --address 100.64.1.20 --user ata --exec --read --write
+./ash doctor
+./ash doctor fedora
+./ash doctor fedora --json
 ./ash exec fedora -- uname -a
 ./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
+printf '{"ok":true}' | ./ash exec fedora --stdin -- elephant receive
 ./ash read fedora /etc/os-release
 printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 ./ash stat fedora /tmp/ash-test.txt
@@ -83,7 +88,13 @@ printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 
 `cwd` and environment values are escaped as literal values; environment names must be valid shell identifiers. Execution assumes a POSIX-compatible remote shell. Quote remote `~/` paths so your local shell does not expand them. SFTP resolves `~/` against its initial remote directory, normally the user's home.
 
+`host add` appends a minimal, deny-by-default entry to the configuration file. It never overwrites an existing host or an unparseable file; capabilities are granted explicitly with `--exec`, `--read`, and `--write`.
+
+`doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and Zellij availability as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
+
 Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts` and `stat` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Writes are not atomic and interruption may leave a partial file.
+
+Pass `--stdin` to forward standard input to the remote command, avoiding shell-quoting and command-size limits. Input is bounded at 64 KiB and fails clearly when exceeded. Without `--stdin`, ASH neither reads nor forwards standard input.
 
 Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Each operation opens and closes its own SSH connection.
 
@@ -117,6 +128,27 @@ Every shell operation requires the host's existing `exec` capability. No additio
 
 Control operations have a 30-second deadline. That deadline limits the control request, not the lifetime of the persistent shell or a command sent to it. Persistence covers ASH/SSH disconnects, not host reboots or termination of Zellij. Treat a canceled or failed send as potentially delivered; do not blindly retry commands with side effects.
 
+## Set up MCP with a coding agent
+
+`ash setup` registers ASH as a stdio MCP server using the absolute ASH executable path and your configuration file. Run it with the same `--config` value (if any) that you use for other commands:
+
+```sh
+./ash setup codex
+./ash setup opencode --scope project
+./ash setup freebuff --scope project
+./ash setup codex --print
+```
+
+| Agent | Scope | File |
+| --- | --- | --- |
+| Codex | user | `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) |
+| Codex | project | `.codex/config.toml` |
+| OpenCode | user | `~/.config/opencode/opencode.json` |
+| OpenCode | project | `opencode.json` |
+| freebuff | project | `.agents/mcp.json` |
+
+Re-running setup updates the existing ASH entry in place instead of creating a duplicate, and leaves unrelated settings and comments untouched. `--print` shows the proposed configuration without writing any file. Restart the agent after setup so it reloads its configuration and starts the ASH server. Unsupported agents receive a clear diagnostic and a manual stdio configuration example.
+
 ## MCP
 
 Configure your MCP client to launch the built binary over stdio:
@@ -137,7 +169,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | Tool | Inputs | Result |
 | --- | --- | --- |
 | `ash_hosts` | `{}` | Public host metadata and capabilities |
-| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
+| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms`, `stdin`, `stdin_base64` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
 | `ash_read` | `host`, `path` | UTF-8 `content` and byte `size` |
 | `ash_write` | `host`, `path`, `content` | Written byte `size` |
 | `ash_stat` | `host`, `path` | `path`, `size`, `mode`, `is_dir`, `modified_at` |
@@ -148,7 +180,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | `ash_shell_wait` | `host`, `shell_id`, `timeout_ms`; optional `cursor`, `until`, `regex` | `content`, `cursor`, `matched`, `truncated`, `resync`, `timed_out` |
 | `ash_shell_close` | `host`, `shell_id` | `closed` |
 
-A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.
+`ash_exec` accepts standard input as UTF-8 `stdin` or base64 `stdin_base64` (mutually exclusive, at most 64 KiB); set either to an empty value to send empty input. A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.
 
 Capabilities grant access with the remote account's permissions. They do not constrain paths or commands: an enabled `exec` capability can itself read or modify files. Configure only hosts and accounts you intend the connected agent to operate.
 
