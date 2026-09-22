@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -56,6 +57,27 @@ func (f *cancelTransport) Exec(ctx context.Context, _ host.Host, _ transport.Exe
 	close(f.canceled)
 	return transport.ExecResult{}, ctx.Err()
 }
+func TestExecStdinFields(t *testing.T) {
+	text := "a\x00b"
+	if data, set, err := execStdin(execInput{Stdin: &text}); err != nil || !set || string(data) != text {
+		t.Fatalf("%q %v %v", data, set, err)
+	}
+	binary := base64.StdEncoding.EncodeToString([]byte{0xff, 0x00})
+	if data, set, err := execStdin(execInput{StdinB64: &binary}); err != nil || !set || len(data) != 2 || data[0] != 0xff {
+		t.Fatalf("%v %v %v", data, set, err)
+	}
+	if _, _, err := execStdin(execInput{Stdin: &text, StdinB64: &binary}); err == nil {
+		t.Fatal("accepted both stdin fields")
+	}
+	bad := "!!!"
+	if _, _, err := execStdin(execInput{StdinB64: &bad}); err == nil {
+		t.Fatal("accepted invalid base64")
+	}
+	if data, set, err := execStdin(execInput{}); err != nil || set || data != nil {
+		t.Fatalf("%v %v %v", data, set, err)
+	}
+}
+
 func TestClientCancellationReachesService(t *testing.T) {
 	ctx, cancelAll := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelAll()

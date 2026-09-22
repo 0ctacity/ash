@@ -55,6 +55,28 @@ func TestSetupCommandParsing(t *testing.T) {
 	}
 }
 
+func TestExecStdinFlag(t *testing.T) {
+	r := new(recorder)
+	s := service.New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Exec: true}}}), r)
+	var out, errout bytes.Buffer
+	code := Run(context.Background(), []string{"exec", "h", "--stdin", "--", "cat"}, s, nil, strings.NewReader("payload"), &out, &errout)
+	if code != 9 || string(r.request.Stdin) != "payload" || !r.request.StdinSet {
+		t.Fatalf("%d %+v %q", code, r.request, errout.String())
+	}
+	// Without --stdin, input is neither consumed nor forwarded.
+	r.request = transport.ExecRequest{}
+	code = Run(context.Background(), []string{"exec", "h", "--", "true"}, s, nil, strings.NewReader("ignored"), &out, &errout)
+	if code != 9 || r.request.StdinSet || r.request.Stdin != nil {
+		t.Fatalf("%d %+v", code, r.request)
+	}
+	// Oversized input fails clearly before reaching the transport.
+	r.request = transport.ExecRequest{}
+	code = Run(context.Background(), []string{"exec", "h", "--stdin", "--", "cat"}, s, nil, strings.NewReader(strings.Repeat("x", transport.MaxExecInputSize+1)), &out, &errout)
+	if code != 1 || r.request.StdinSet || !strings.Contains(errout.String(), "input exceeds") {
+		t.Fatalf("%d %+v %q", code, r.request, errout.String())
+	}
+}
+
 func TestWriteCancellationInterruptsStdin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
