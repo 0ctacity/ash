@@ -10,7 +10,10 @@ import (
 	"ash/internal/transport"
 )
 
-type fakeTransport struct{ calls int }
+type fakeTransport struct {
+	transport.Transport
+	calls int
+}
 
 func (f *fakeTransport) Exec(context.Context, host.Host, transport.ExecRequest) (transport.ExecResult, error) {
 	f.calls++
@@ -36,7 +39,14 @@ func TestDeniedOperationsNeverReachTransport(t *testing.T) {
 	_, e2 := s.Read(ctx, "denied", "/x")
 	e3 := s.Write(ctx, "denied", "/x", nil)
 	_, e4 := s.Stat(ctx, "denied", "/x")
-	for _, err := range []error{e1, e2, e3, e4} {
+	_, e5 := s.List(ctx, "denied", "/x")
+	e6 := s.Mkdir(ctx, "denied", "/x")
+	e7 := s.Rename(ctx, "denied", "/x", "/y")
+	e8 := s.Remove(ctx, "denied", "/x")
+	e9 := s.AtomicWrite(ctx, "denied", "/x", nil)
+	_, e10 := s.ReadTree(ctx, "denied", "/x")
+	e11 := s.WriteTree(ctx, "denied", "/x", nil)
+	for _, err := range []error{e1, e2, e3, e4, e5, e6, e7, e8, e9, e10, e11} {
 		if !errors.Is(err, policy.ErrPermissionDenied) {
 			t.Fatalf("got %v", err)
 		}
@@ -81,6 +91,37 @@ func TestCanceledAndOversizedRequestsDoNotReachTransport(t *testing.T) {
 	}
 	if f.calls != 0 {
 		t.Fatalf("transport called %d times", f.calls)
+	}
+}
+
+type fileTransport struct {
+	transport.Transport
+	calls int
+}
+
+func (f *fileTransport) Mkdir(context.Context, host.Host, string) error { f.calls++; return nil }
+func (f *fileTransport) WriteTree(_ context.Context, _ host.Host, _ string, _ []transport.TreeEntry) error {
+	f.calls++
+	return nil
+}
+
+func TestTreeOpsValidateBeforeTransport(t *testing.T) {
+	f := new(fileTransport)
+	s := New(host.New(map[string]host.Host{"h": {Policy: policy.Policy{Write: true}}}), f)
+	if err := s.WriteTree(context.Background(), "h", "/remote", []transport.TreeEntry{{Path: "../escape", Data: []byte("x")}}); err == nil {
+		t.Fatal("accepted unsafe tree")
+	}
+	if f.calls != 0 {
+		t.Fatal("unsafe tree reached transport")
+	}
+	if err := s.Mkdir(context.Background(), "h", ""); err == nil {
+		t.Fatal("accepted empty path")
+	}
+	if f.calls != 0 {
+		t.Fatal("empty path reached transport")
+	}
+	if err := s.WriteTree(context.Background(), "h", "/remote", []transport.TreeEntry{{Path: "ok", Data: []byte("x")}}); err != nil || f.calls != 1 {
+		t.Fatalf("%v calls=%d", err, f.calls)
 	}
 }
 

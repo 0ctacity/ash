@@ -38,7 +38,7 @@ func TestStdioMCP(t *testing.T) {
 	}
 	defer session.Close()
 	tools, err := session.ListTools(ctx, nil)
-	if err != nil || len(tools.Tools) != 11 {
+	if err != nil || len(tools.Tools) != 18 {
 		t.Fatalf("tools: %+v %v", tools, err)
 	}
 	result, err := session.CallTool(ctx, &sdk.CallToolParams{Name: "ash_hosts", Arguments: map[string]any{}})

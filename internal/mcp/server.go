@@ -39,17 +39,73 @@ type fileInput struct {
 	Host string `json:"host"`
 	Path string `json:"path"`
 }
+type readInput struct {
+	Host     string `json:"host"`
+	Path     string `json:"path"`
+	Encoding string `json:"encoding,omitempty" jsonschema:"Optional. \"text\" (default) returns UTF-8 content; \"base64\" returns base64 for binary files."`
+}
 type writeInput struct {
-	Host    string `json:"host"`
-	Path    string `json:"path"`
-	Content string `json:"content"`
+	Host          string  `json:"host"`
+	Path          string  `json:"path"`
+	Content       *string `json:"content,omitempty"`
+	ContentBase64 *string `json:"content_base64,omitempty" jsonschema:"Base64-encoded bytes. Mutually exclusive with content."`
 }
 type readOutput struct {
-	Content string `json:"content"`
-	Size    int    `json:"size"`
+	Content       string `json:"content,omitempty"`
+	ContentBase64 string `json:"content_base64,omitempty"`
+	Size          int    `json:"size"`
 }
 type writeOutput struct {
 	Size int `json:"size"`
+}
+type renameInput struct {
+	Host string `json:"host"`
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+type listOutput struct {
+	Entries []transport.DirEntry `json:"entries"`
+}
+type treeResultEntry struct {
+	Path          string `json:"path"`
+	IsDir         bool   `json:"is_dir"`
+	Mode          string `json:"mode,omitempty"`
+	Size          int    `json:"size"`
+	ContentBase64 string `json:"content_base64,omitempty"`
+}
+type downloadOutput struct {
+	Entries []treeResultEntry `json:"entries"`
+}
+type treeInputEntry struct {
+	Path          string `json:"path"`
+	IsDir         bool   `json:"is_dir"`
+	ContentBase64 string `json:"content_base64,omitempty"`
+}
+type uploadInput struct {
+	Host    string           `json:"host"`
+	Path    string           `json:"path"`
+	Entries []treeInputEntry `json:"entries"`
+}
+type okOutput struct {
+	OK bool `json:"ok"`
+}
+
+// decodeContent resolves the mutually exclusive text and base64 payload fields.
+func decodeContent(content *string, contentBase64 *string) ([]byte, error) {
+	if content != nil && contentBase64 != nil {
+		return nil, fmt.Errorf("provide only one of content or content_base64")
+	}
+	if contentBase64 != nil {
+		data, err := base64.StdEncoding.DecodeString(*contentBase64)
+		if err != nil {
+			return nil, fmt.Errorf("content_base64 is not valid base64: %w", err)
+		}
+		return data, nil
+	}
+	if content != nil {
+		return []byte(*content), nil
+	}
+	return nil, nil
 }
 
 // execStdin resolves the mutually exclusive text and binary stdin fields.
@@ -87,21 +143,94 @@ func New(s *service.Service, shells *service.ShellService) *sdk.Server {
 		r, err := s.Exec(ctx, transport.ExecRequest{Host: in.Host, Command: in.Command, Cwd: in.Cwd, Env: in.Env, Timeout: timeout, Stdin: stdin, StdinSet: stdinSet})
 		return nil, execOutput{ExitCode: r.ExitCode, Stdout: r.Stdout, Stderr: r.Stderr, StdoutTruncated: r.StdoutTruncated, StderrTruncated: r.StderrTruncated, DurationMS: r.Duration.Milliseconds()}, err
 	})
-	sdk.AddTool(server, &sdk.Tool{Name: "ash_read", Description: "Read up to 4 MiB of UTF-8 text using SFTP."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, readOutput, error) {
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_read", Description: "Read up to 4 MiB using SFTP. Returns UTF-8 content by default, or base64 when encoding is \"base64\"."}, func(ctx context.Context, _ *sdk.CallToolRequest, in readInput) (*sdk.CallToolResult, readOutput, error) {
 		data, err := s.Read(ctx, in.Host, in.Path)
 		if err != nil {
 			return nil, readOutput{}, err
 		}
-		content, err := service.Text(data)
-		return nil, readOutput{Content: content, Size: len(data)}, err
+		out := readOutput{Size: len(data)}
+		switch in.Encoding {
+		case "", "text":
+			content, err := service.Text(data)
+			if err != nil {
+				return nil, readOutput{}, err
+			}
+			out.Content = content
+		case "base64":
+			out.ContentBase64 = base64.StdEncoding.EncodeToString(data)
+		default:
+			return nil, readOutput{}, fmt.Errorf("encoding must be \"text\" or \"base64\"")
+		}
+		return nil, out, nil
 	})
-	sdk.AddTool(server, &sdk.Tool{Name: "ash_write", Description: "Create or truncate a file through SFTP, up to 4 MiB. Parent directory must exist."}, func(ctx context.Context, _ *sdk.CallToolRequest, in writeInput) (*sdk.CallToolResult, writeOutput, error) {
-		err := s.Write(ctx, in.Host, in.Path, []byte(in.Content))
-		return nil, writeOutput{Size: len(in.Content)}, err
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_write", Description: "Create or truncate a file through SFTP, up to 4 MiB. Parent directory must exist. Supplying content_base64 implies binary semantics."}, func(ctx context.Context, _ *sdk.CallToolRequest, in writeInput) (*sdk.CallToolResult, writeOutput, error) {
+		data, err := decodeContent(in.Content, in.ContentBase64)
+		if err != nil {
+			return nil, writeOutput{}, err
+		}
+		err = s.Write(ctx, in.Host, in.Path, data)
+		return nil, writeOutput{Size: len(data)}, err
 	})
 	sdk.AddTool(server, &sdk.Tool{Name: "ash_stat", Description: "Inspect file metadata through SFTP. Requires read capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, transport.FileInfo, error) {
 		r, err := s.Stat(ctx, in.Host, in.Path)
 		return nil, r, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_list", Description: "List the sorted direct children of a remote directory. Requires read capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, listOutput, error) {
+		entries, err := s.List(ctx, in.Host, in.Path)
+		return nil, listOutput{Entries: entries}, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_mkdir", Description: "Create one remote directory. Parent directories must already exist. Requires write capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, okOutput, error) {
+		err := s.Mkdir(ctx, in.Host, in.Path)
+		return nil, okOutput{OK: err == nil}, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_rename", Description: "Rename or move a remote file or directory. Requires write capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in renameInput) (*sdk.CallToolResult, okOutput, error) {
+		err := s.Rename(ctx, in.Host, in.From, in.To)
+		return nil, okOutput{OK: err == nil}, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_remove", Description: "Remove a remote file or empty directory. Never recursive. Requires write capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, okOutput, error) {
+		err := s.Remove(ctx, in.Host, in.Path)
+		return nil, okOutput{OK: err == nil}, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_write_atomic", Description: "Atomically replace a remote file: a same-directory temporary file is written and renamed, leaving the prior file intact on failure. Requires write capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in writeInput) (*sdk.CallToolResult, writeOutput, error) {
+		data, err := decodeContent(in.Content, in.ContentBase64)
+		if err != nil {
+			return nil, writeOutput{}, err
+		}
+		err = s.AtomicWrite(ctx, in.Host, in.Path, data)
+		return nil, writeOutput{Size: len(data)}, err
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_download", Description: "Return a bounded remote directory tree (max 4 MiB, 1000 entries, depth 32) as base64 file entries. Symlinks are skipped. Requires read capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in fileInput) (*sdk.CallToolResult, downloadOutput, error) {
+		entries, err := s.ReadTree(ctx, in.Host, in.Path)
+		if err != nil {
+			return nil, downloadOutput{}, err
+		}
+		out := make([]treeResultEntry, 0, len(entries))
+		for _, entry := range entries {
+			item := treeResultEntry{Path: entry.Path, IsDir: entry.IsDir, Mode: entry.Mode, Size: len(entry.Data)}
+			if !entry.IsDir {
+				item.ContentBase64 = base64.StdEncoding.EncodeToString(entry.Data)
+			}
+			out = append(out, item)
+		}
+		return nil, downloadOutput{Entries: out}, nil
+	})
+	sdk.AddTool(server, &sdk.Tool{Name: "ash_upload", Description: "Write a bounded remote directory tree from path/is_dir/content_base64 entries. Rejects absolute paths, traversal, duplicates, and type conflicts before mutating. Requires write capability."}, func(ctx context.Context, _ *sdk.CallToolRequest, in uploadInput) (*sdk.CallToolResult, writeOutput, error) {
+		entries := make([]transport.TreeEntry, 0, len(in.Entries))
+		total := 0
+		for _, entry := range in.Entries {
+			out := transport.TreeEntry{Path: entry.Path, IsDir: entry.IsDir}
+			if !entry.IsDir {
+				data, err := base64.StdEncoding.DecodeString(entry.ContentBase64)
+				if err != nil {
+					return nil, writeOutput{}, fmt.Errorf("entry %q: content_base64 is not valid base64", entry.Path)
+				}
+				out.Data = data
+				total += len(data)
+			}
+			entries = append(entries, out)
+		}
+		err := s.WriteTree(ctx, in.Host, in.Path, entries)
+		return nil, writeOutput{Size: total}, err
 	})
 	registerShellTools(server, shells)
 	return server

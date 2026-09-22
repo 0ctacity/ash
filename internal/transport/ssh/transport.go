@@ -8,6 +8,7 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -18,7 +19,15 @@ import (
 	"strings"
 )
 
-type Transport struct{ knownHostsPath string }
+type Transport struct {
+	knownHostsPath string
+	// dialOverride, when set by tests, replaces the TCP dial and SSH
+	// handshake so operations run against an in-process transport.
+	dialOverride func(ctx context.Context, h host.Host) (*gossh.Client, func(), error)
+	// newSFTPDial, when set by tests, supplies an SFTP client directly,
+	// bypassing connection setup entirely.
+	newSFTPDial func(ctx context.Context, h host.Host) (*sftp.Client, func(), error)
+}
 
 func New(knownHostsPath string) (*Transport, error) {
 	return &Transport{knownHostsPath: knownHostsPath}, nil
@@ -47,6 +56,9 @@ func operationError(ctx context.Context, err error) error {
 func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, operationError(ctx, err)
+	}
+	if t.dialOverride != nil {
+		return t.dialOverride(ctx, h)
 	}
 	hostKey, err := t.knownHosts()
 	if err != nil {
