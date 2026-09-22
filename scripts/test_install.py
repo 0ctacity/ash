@@ -38,9 +38,9 @@ while [ "$#" -gt 0 ]; do
 done
 [ "$FAIL_DOWNLOAD" = 0 ] || exit 22
 case "$url" in
-  */releases/latest) printf 'https://github.com/0ctacity/ash/releases/tag/v1.2.3';;
-  */SHA256SUMS.txt) printf '%s  %s\n' "$DIGEST" "$ASSET" > "$out";;
-  */"$ASSET") cp "$ARCHIVE" "$out";;
+  https://github.com/octacity-org/ash/releases/latest) printf 'https://github.com/octacity-org/ash/releases/tag/v1.2.3';;
+  https://github.com/octacity-org/ash/releases/download/v1.2.3/SHA256SUMS.txt) printf '%s  %s\n' "$DIGEST" "$ASSET" > "$out";;
+  https://github.com/octacity-org/ash/releases/download/v1.2.3/"$ASSET") cp "$ARCHIVE" "$out";;
   *) exit 23;;
 esac
 ''')

@@ -3,7 +3,7 @@
 set -eu
 
 main() {
-    repository=https://github.com/0ctacity/ash
+    repository=https://github.com/octacity-org/ash
     for utility in curl tar mktemp; do
         command -v "$utility" >/dev/null 2>&1 || { echo "Required command missing: $utility" >&2; exit 1; }
     done

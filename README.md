@@ -7,7 +7,7 @@ ASH lets coding agents operate on other machines over SSH. It is a local Go bina
 On Linux AMD64/ARM64 or macOS Apple Silicon, install the latest stable GitHub release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0ctacity/ash/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/octacity-org/ash/main/install.sh | sh
 ```
 
 The installer verifies the archive against the release's SHA256SUMS.txt and installs
@@ -16,12 +16,12 @@ It requires `curl`, `tar`, and either `sha256sum` or `shasum`; Go is not require
 Run the same command again to update. To select a release or installation directory:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/0ctacity/ash/main/install.sh | ASH_VERSION=v0.1.0 ASH_INSTALL_DIR="$HOME/bin" sh
+curl -fsSL https://raw.githubusercontent.com/octacity-org/ash/main/install.sh | ASH_VERSION=v0.2.0 ASH_INSTALL_DIR="$HOME/bin" sh
 ```
 
 These URLs work after the installer is pushed to `main` and a matching release is
 published. Windows users can extract `ash.exe` from the Windows archive on
-[GitHub Releases](https://github.com/0ctacity/ash/releases).
+[GitHub Releases](https://github.com/octacity-org/ash/releases).
 
 Installation only places the executable on your machine. Configure a host and
 register the MCP server with your client using the sections below.
@@ -40,13 +40,13 @@ go build -o ash ./cmd/ash
 Create `~/.config/ash/config.toml`:
 
 ```toml
-[hosts.fedora]
-address = "100.64.1.20"
-user = "ata"
+[hosts.example]
+address = "server.example.com"
+user = "remote-user"
 # port = 22
 # identity = "~/.ssh/id_ed25519"
 
-[hosts.fedora.policy]
+[hosts.example.policy]
 exec = true
 read = true
 write = true
@@ -59,7 +59,7 @@ Authenticate using keys from `SSH_AUTH_SOCK`, or an explicit identity file. Load
 ASH verifies the configured address and port against `~/.ssh/known_hosts`. Establish trust yourself with OpenSSH, verifying the host fingerprint through a trusted channel. For the example above:
 
 ```sh
-ssh ata@100.64.1.20
+ssh remote-user@server.example.com
 ```
 
 Use `ssh -p PORT USER@ADDRESS` for a custom port. Listing hosts and starting MCP do not require a connection or a known-hosts file; remote operations require a trusted host key.
@@ -69,10 +69,10 @@ Use `ssh -p PORT USER@ADDRESS` for a custom port. Listing hosts and starting MCP
 An ASH host may reference an OpenSSH alias instead of duplicating connection details:
 
 ```toml
-[hosts.fedora]
-ssh_alias = "fedora"
+[hosts.example]
+ssh_alias = "my-server"
 
-[hosts.fedora.policy]
+[hosts.example.policy]
 exec = true
 read = true
 write = true
@@ -85,7 +85,7 @@ ASH resolves the alias once at startup by running the installed OpenSSH client (
 Capabilities can be narrowed without breaking existing configuration:
 
 ```toml
-[hosts.fedora.policy]
+[hosts.example.policy]
 exec = true
 read = true
 write = true
@@ -113,30 +113,30 @@ Each record contains the time, operation, ASH host, policy decision, duration, r
 
 ```sh
 ./ash hosts
-./ash host add fedora --address 100.64.1.20 --user ata --exec --read --write
+./ash host add example --address server.example.com --user remote-user --exec --read --write
 ./ash doctor
-./ash doctor fedora
-./ash doctor fedora --json
-./ash exec fedora -- uname -a
-./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
-./ash execv fedora -- systemctl is-active nginx
-printf '{"ok":true}' | ./ash exec fedora --stdin -- elephant receive
-./ash read fedora /etc/os-release
-printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
-printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt --atomic
-./ash stat fedora /tmp/ash-test.txt
-./ash list fedora /tmp
-./ash mkdir fedora /tmp/ash-dir
-./ash rename fedora /tmp/ash-dir /tmp/ash-dir2
-./ash remove fedora /tmp/ash-dir2
-./ash download fedora /tmp/remote-tree ./local-tree
-./ash upload fedora ./local-tree /tmp/remote-tree
+./ash doctor example
+./ash doctor example --json
+./ash exec example -- uname -a
+./ash exec example --cwd '~/projects/app' --env CI=true --timeout 30s -- go test ./...
+./ash execv example -- systemctl is-active nginx
+printf '{"ok":true}' | ./ash exec example --stdin -- elephant receive
+./ash read example /etc/os-release
+printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt
+printf 'hello from ASH\n' | ./ash write example /tmp/ash-test.txt --atomic
+./ash stat example /tmp/ash-test.txt
+./ash list example /tmp
+./ash mkdir example /tmp/ash-dir
+./ash rename example /tmp/ash-dir /tmp/ash-dir2
+./ash remove example /tmp/ash-dir2
+./ash download example /tmp/remote-tree ./local-tree
+./ash upload example ./local-tree /tmp/remote-tree
 ```
 
 `exec` joins everything after `--` with spaces into **shell code**, executed through the remote user's shell. For shell expressions or arguments containing spaces, pass one quoted command string:
 
 ```sh
-./ash exec fedora -- 'printf "%s\n" "hello world"; exit 7'
+./ash exec example -- 'printf "%s\n" "hello world"; exit 7'
 ```
 
 `cwd` and environment values are escaped as literal values; environment names must be valid shell identifiers. Execution assumes a POSIX-compatible remote shell. Quote remote `~/` paths so your local shell does not expand them. SFTP resolves `~/` against its initial remote directory, normally the user's home.
@@ -162,26 +162,26 @@ Each command output stream is capped at 8 MiB and reports truncation. Reads and 
 Persistent shells use a per-host backend. Zellij ([headless CLI](https://zellij.dev/documentation/cli-recipes.html), 0.44 or newer) is the default; tmux is selected with `shell_backend = "tmux"` and requires tmux on the remote host.
 
 ```toml
-[hosts.fedora]
-address = "100.64.1.20"
-user = "ata"
+[hosts.example]
+address = "server.example.com"
+user = "remote-user"
 shell_backend = "tmux"
 ```
 
 CLI and MCP behavior is backend-independent; backend-specific features are never exposed. Both backends map ASH-generated IDs to a reserved remote namespace (`ash-<id>`) and query the backend for liveness rather than trusting local metadata, so ASH lists and controls only its own sessions. tmux uses a dedicated server socket (`tmux -L ash`), keeping ASH sessions fully separate from the user's personal sessions. Shells are separate from one-shot `exec`: shell variables, working directory, and running commands survive ASH process exits and SSH disconnects. ASH opens short SSH connections to control the backend; it does not keep an SSH session alive.
 
 ```sh
-./ash shell create fedora --cwd '~/projects'
-./ash shell list fedora
+./ash shell create example --cwd '~/projects'
+./ash shell list example
 ```
 
 Creation returns JSON containing an ASH `id`, `host`, and `backend`. Set `SHELL_ID` to the returned `id`, then:
 
 ```sh
-printf 'pwd\n' | ./ash shell send fedora "$SHELL_ID"
-./ash shell read fedora "$SHELL_ID"
-./ash shell wait fedora "$SHELL_ID" --until READY --timeout 30s
-./ash shell close fedora "$SHELL_ID"
+printf 'pwd\n' | ./ash shell send example "$SHELL_ID"
+./ash shell read example "$SHELL_ID"
+./ash shell wait example "$SHELL_ID" --until READY --timeout 30s
+./ash shell close example "$SHELL_ID"
 ```
 
 `send` accepts an optional literal INPUT argument, or reads stdin when omitted. It adds no newline: include one to submit a command. It returns after delivering input, without waiting for the shell command to finish. Input is UTF-8 without NUL and is limited to 64 KiB.
@@ -259,9 +259,9 @@ Capabilities grant access with the remote account's permissions. A bare boolean 
 
 ## Architecture
 
-CLI and MCP call the same service layer. Services resolve hosts, enforce policy, and set deadlines. The transport interface implements execution and file operations; its SSH backend uses verified SSH sessions and SFTP. Transport code does not make authorization decisions. A separate shell service enforces the same host policy and calls a shell backend interface. The Zellij backend uses the SSH transport for short control commands; CLI and MCP contain no Zellij-specific logic.
+CLI and MCP call the same service layer. Services resolve hosts, enforce policy, and set deadlines. The transport interface implements execution and file operations; its SSH backend pools verified SSH connections and uses SFTP. Transport code does not make authorization decisions. A separate shell service enforces the same host policy and calls a shell backend interface. The Zellij backend uses the SSH transport for short control commands; CLI and MCP contain no Zellij-specific logic.
 
-ASH excludes connection pooling, full-screen terminal attachment, jobs, synchronization, forwarding, discovery, sudo handling, and HTTP.
+ASH excludes full-screen terminal attachment, jobs, synchronization, forwarding, discovery, sudo handling, and HTTP.
 
 ## Verify
 
@@ -275,7 +275,7 @@ The tests cover configuration, policy, shell escaping, output limits, CLI behavi
 Persistent-shell integration requires a trusted host with Zellij 0.44 or newer (the tmux backend is unit-tested against exact command construction; opt-in remote tmux tests can use the same environment):
 
 ```sh
-ASH_ZELLIJ_HOST=fedora ASH_ZELLIJ_CONFIG="$HOME/.config/ash/config.toml" \
+ASH_ZELLIJ_HOST=example ASH_ZELLIJ_CONFIG="$HOME/.config/ash/config.toml" \
   go test -v ./integration ./cmd/ash -run 'TestZellij|TestPersistentShellMCPReconnect'
 ```
 
@@ -292,7 +292,7 @@ These opt-in tests create and clean up their own remote ASH sessions. They cover
 
 The two tests that execute a POSIX shell locally run on Unix runners. Configured-host Zellij tests and the opt-in local OpenSSH daemon fixture retain their explicit opt-in settings; the standard CI run needs no SSH credentials.
 
-Pushing a tag such as `v0.1.0` or `v0.1.0-rc.1` builds four native release archives. Unix targets use `.tar.gz`; Windows uses `.zip`. Each contains the executable, this README, and dependency/Go license notices. A release-wide `SHA256SUMS.txt` covers exactly those four archives.
+Pushing a tag such as `v0.2.0` or `v0.2.0-rc.1` builds four native release archives. Unix targets use `.tar.gz`; Windows uses `.zip`. Each contains the executable, this README, and dependency/Go license notices. A release-wide `SHA256SUMS.txt` covers exactly those four archives.
 
 The release job waits for every platform to succeed, creates or resumes a draft GitHub release, uploads all assets, then publishes it. Tags with a prerelease suffix are marked as prereleases. Already-published releases are not overwritten. Release publishing uses the workflow's GitHub token with `contents: write`; build jobs have read-only permissions.
 
@@ -300,7 +300,7 @@ Release builds stamp the same version into `ash --version` and MCP server metada
 
 ```sh
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
-python3 scripts/release.py version v0.1.0-rc.1
+python3 scripts/release.py version v0.2.0-rc.1
 ```
 
 The workflow becomes active once this project is pushed to GitHub. Tagging and publishing are separate from implementing these workflow files.
