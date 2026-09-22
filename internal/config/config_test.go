@@ -25,6 +25,16 @@ func TestPolicyValidationAndAuditLog(t *testing.T) {
 	}
 }
 
+func TestShellBackendValidation(t *testing.T) {
+	c, err := Parse([]byte("[hosts.x]\naddress='a'\nuser='b'\nshell_backend='tmux'\n"))
+	if err != nil || c.Hosts["x"].ShellBackend != "tmux" {
+		t.Fatalf("%+v %v", c.Hosts["x"], err)
+	}
+	if _, err := Parse([]byte("[hosts.x]\naddress='a'\nuser='b'\nshell_backend='screen'\n")); err == nil {
+		t.Fatal("accepted unknown shell_backend")
+	}
+}
+
 func TestParseDefaultsAndValidation(t *testing.T) {
 	c, err := Parse([]byte("[hosts.fedora]\naddress='100.64.1.20'\nuser='ata'\n"))
 	if err != nil {

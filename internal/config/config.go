@@ -47,6 +47,11 @@ func Parse(data []byte) (Config, error) {
 		if err := h.Policy.Validate(); err != nil {
 			return c, fmt.Errorf("host %q: %w", name, err)
 		}
+		switch h.ShellBackend {
+		case "", "zellij", "tmux":
+		default:
+			return c, fmt.Errorf("host %q: shell_backend must be zellij or tmux", name)
+		}
 		h.Name = name
 		c.Hosts[name] = h
 	}

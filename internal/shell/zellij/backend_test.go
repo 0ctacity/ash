@@ -86,6 +86,61 @@ func TestEmptyAndTruncatedLists(t *testing.T) {
 	}
 }
 
+func readSnapshot(t *testing.T, dump, cursor string, truncated bool) shell.Output {
+	t.Helper()
+	f := &fakeTransport{results: []transport.ExecResult{
+		{Stdout: "ash-" + testID + " [Created now]\n"},
+		{Stdout: `[{"id":7,"is_plugin":false}]`},
+		{Stdout: dump, StdoutTruncated: truncated},
+	}}
+	out, err := New(f).Read(context.Background(), host.Host{}, testID, shell.ReadRequest{Cursor: cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestReadSnapshotAndIncremental(t *testing.T) {
+	first := readSnapshot(t, "hello world", "", false)
+	if first.Content != "hello world" || first.Cursor == "" || first.Resync || first.Truncated {
+		t.Fatalf("%+v", first)
+	}
+	second := readSnapshot(t, "hello world!!", first.Cursor, false)
+	if second.Content != "!!" || second.Resync || second.Cursor == "" {
+		t.Fatalf("%+v", second)
+	}
+	third := readSnapshot(t, "hello world!!", second.Cursor, false)
+	if third.Content != "" || third.Resync {
+		t.Fatalf("%+v", third)
+	}
+}
+
+func TestReadResyncsOnChangedOrInvalidCursor(t *testing.T) {
+	stale, err := shell.EncodeCursor(testID, "terminal_7", []byte("different"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := readSnapshot(t, "hello", stale, false)
+	if !out.Resync || out.Content != "hello" || out.Cursor == "" {
+		t.Fatalf("%+v", out)
+	}
+	invalid := readSnapshot(t, "hello", "not-a-cursor", false)
+	if !invalid.Resync || invalid.Content != "hello" {
+		t.Fatalf("%+v", invalid)
+	}
+	wrongShell, _ := shell.EncodeCursor("sh_ffffffffffffffffffffffffffffffff", "terminal_7", []byte("hello"))
+	if out := readSnapshot(t, "hello", wrongShell, false); !out.Resync {
+		t.Fatalf("%+v", out)
+	}
+}
+
+func TestReadReportsTruncation(t *testing.T) {
+	out := readSnapshot(t, "partial", "", true)
+	if !out.Truncated || out.Content != "partial" {
+		t.Fatalf("%+v", out)
+	}
+}
+
 func TestCloseAbsentShellCleansOnlyItsConfig(t *testing.T) {
 	f := &fakeTransport{results: []transport.ExecResult{{}, {ExitCode: 2, Stderr: `Session: "ash-` + testID + `" not found.`}, {}}}
 	if err := New(f).Close(context.Background(), host.Host{}, testID); err != nil {

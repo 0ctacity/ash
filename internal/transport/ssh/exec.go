@@ -128,6 +128,14 @@ func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecReq
 		return result, operationError(ctx, err)
 	}
 	defer session.Close()
+	if req.StdinSet {
+		if len(req.Stdin) > transport.MaxExecInputSize {
+			return result, transport.ErrInputTooLarge
+		}
+		// A bytes.Reader sends EOF after the payload, so the remote stdin stream
+		// closes even when the process expects input until end of file.
+		session.Stdin = bytes.NewReader(req.Stdin)
+	}
 	limit := transport.MaxOutputSize
 	if req.MaxOutput > 0 && req.MaxOutput < limit {
 		limit = req.MaxOutput
@@ -136,6 +144,10 @@ func (t *Transport) Exec(ctx context.Context, h host.Host, req transport.ExecReq
 	stderr := limitedBuffer{limit: limit}
 	session.Stdout = &stdout
 	session.Stderr = &stderr
+	// Close the channel when the context ends so a stalled stdin write or a
+	// hung remote process cannot keep Run blocked past cancellation.
+	stop := context.AfterFunc(ctx, func() { session.Close() })
+	defer stop()
 	err = session.Run(command)
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()

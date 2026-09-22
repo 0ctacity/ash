@@ -107,7 +107,7 @@ func TestZellij(t *testing.T) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		output, e := zellij.New(tr).Read(ctx, h, id)
+		output, e := zellij.New(tr).Read(ctx, h, id, shell.ReadRequest{})
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -122,15 +122,23 @@ func TestZellij(t *testing.T) {
 	if err = zellij.New(tr).Send(ctx, h, id, "printf '\\nSTATE_%s\\n' \"$ASH_STATE\"\n"); err != nil {
 		t.Fatal(err)
 	}
-	output, err := zellij.New(tr).Read(ctx, h, id)
+	output, err := zellij.New(tr).Read(ctx, h, id, shell.ReadRequest{})
 	if err != nil || !strings.Contains(output.Content, "STATE_survives") {
 		t.Fatalf("state: %+v %v", output, err)
+	}
+	if output.Cursor == "" {
+		t.Fatal("read did not return a cursor")
+	}
+	// Reading again with the cursor must not repeat output or resynchronize.
+	incremental, err := zellij.New(tr).Read(ctx, h, id, shell.ReadRequest{Cursor: output.Cursor})
+	if err != nil || incremental.Content != "" || incremental.Resync {
+		t.Fatalf("incremental read: %+v %v", incremental, err)
 	}
 	t.Log("closing named session and verifying fresh liveness")
 	if err = backend.Close(ctx, h, id); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = zellij.New(tr).Read(ctx, h, id); !errors.Is(err, shell.ErrNotFound) {
+	if _, err = zellij.New(tr).Read(ctx, h, id, shell.ReadRequest{}); !errors.Is(err, shell.ErrNotFound) {
 		t.Fatalf("closed session: %v", err)
 	}
 	if err = backend.Create(ctx, h, id, cwd); err != nil {
@@ -140,7 +148,7 @@ func TestZellij(t *testing.T) {
 	if err != nil || r.ExitCode != 0 {
 		t.Fatalf("external kill: %+v %v", r, err)
 	}
-	if _, err = zellij.New(tr).Read(ctx, h, id); !errors.Is(err, shell.ErrNotFound) {
+	if _, err = zellij.New(tr).Read(ctx, h, id, shell.ReadRequest{}); !errors.Is(err, shell.ErrNotFound) {
 		t.Fatalf("externally killed session: %v", err)
 	}
 }

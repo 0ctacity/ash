@@ -152,11 +152,15 @@ func (s *Service) exec(ctx context.Context, h host.Host, req transport.ExecReque
 	} else if err := h.Policy.CheckShell(); err != nil {
 		return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
 	}
+	if len(req.Stdin) > transport.MaxExecInputSize {
+		return transport.ExecResult{}, fmt.Errorf("exec input exceeds %d byte limit", transport.MaxExecInputSize)
+	}
+	if err := h.Policy.CheckInput(len(req.Stdin)); err != nil {
+		return transport.ExecResult{}, fmt.Errorf("host %q: exec: %w", name, err)
+	}
 	if req.Timeout < 0 {
 		return transport.ExecResult{}, fmt.Errorf("timeout must be positive")
 	}
-	// max_input_bytes bounds stdin. This branch has no stdin path yet (#1);
-	// the setting is validated in config and enforced once stdin lands.
 	if h.Policy.MaxOutputBytes > 0 {
 		req.MaxOutput = int(h.Policy.MaxOutputBytes)
 	}
@@ -253,6 +257,171 @@ func (s *Service) Stat(ctx context.Context, name, path string) (transport.FileIn
 	err = operationError(ctx, name, "stat", err)
 	s.finish("stat", name, started, err)
 	return result, err
+}
+
+func (s *Service) List(ctx context.Context, name, p string) ([]transport.DirEntry, error) {
+	started := time.Now()
+	h, err := s.authorize(name, "read")
+	if err != nil {
+		return nil, err
+	}
+	if p == "" {
+		return nil, s.fail("list", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, s.fail("list", name, started, operationError(ctx, name, "list", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "list", p, false); err != nil {
+		return nil, s.fail("list", name, started, err)
+	}
+	entries, err := s.transport.List(ctx, h, p)
+	err = operationError(ctx, name, "list", err)
+	s.finish("list", name, started, err)
+	return entries, err
+}
+
+func (s *Service) Mkdir(ctx context.Context, name, p string) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if p == "" {
+		return s.fail("mkdir", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("mkdir", name, started, operationError(ctx, name, "mkdir", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "mkdir", p, true); err != nil {
+		return s.fail("mkdir", name, started, err)
+	}
+	err = operationError(ctx, name, "mkdir", s.transport.Mkdir(ctx, h, p))
+	s.finish("mkdir", name, started, err)
+	return err
+}
+
+func (s *Service) Rename(ctx context.Context, name, from, to string) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if from == "" || to == "" {
+		return s.fail("rename", name, started, fmt.Errorf("source and destination must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("rename", name, started, operationError(ctx, name, "rename", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "rename", from, true); err != nil {
+		return s.fail("rename", name, started, err)
+	}
+	if err := s.enforceRoots(ctx, h, name, "rename", to, true); err != nil {
+		return s.fail("rename", name, started, err)
+	}
+	err = operationError(ctx, name, "rename", s.transport.Rename(ctx, h, from, to))
+	s.finish("rename", name, started, err)
+	return err
+}
+
+func (s *Service) Remove(ctx context.Context, name, p string) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if p == "" {
+		return s.fail("remove", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("remove", name, started, operationError(ctx, name, "remove", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "remove", p, true); err != nil {
+		return s.fail("remove", name, started, err)
+	}
+	err = operationError(ctx, name, "remove", s.transport.Remove(ctx, h, p))
+	s.finish("remove", name, started, err)
+	return err
+}
+
+// AtomicWrite replaces a remote file completely or leaves the prior file intact.
+func (s *Service) AtomicWrite(ctx context.Context, name, p string, data []byte) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if p == "" {
+		return s.fail("write atomic", name, started, fmt.Errorf("path must not be empty"))
+	}
+	if len(data) > transport.MaxWriteSize {
+		return s.fail("write atomic", name, started, fmt.Errorf("write exceeds %d byte limit", transport.MaxWriteSize))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("write atomic", name, started, operationError(ctx, name, "write atomic", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "write atomic", p, true); err != nil {
+		return s.fail("write atomic", name, started, err)
+	}
+	err = operationError(ctx, name, "write atomic", s.transport.AtomicWrite(ctx, h, p, data))
+	s.finish("write atomic", name, started, err)
+	return err
+}
+
+// ReadTree returns a bounded, symlink-free tree rooted at a remote directory.
+func (s *Service) ReadTree(ctx context.Context, name, p string) ([]transport.TreeEntry, error) {
+	started := time.Now()
+	h, err := s.authorize(name, "read")
+	if err != nil {
+		return nil, err
+	}
+	if p == "" {
+		return nil, s.fail("download", name, started, fmt.Errorf("path must not be empty"))
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return nil, s.fail("download", name, started, operationError(ctx, name, "download", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "download", p, false); err != nil {
+		return nil, s.fail("download", name, started, err)
+	}
+	entries, err := s.transport.ReadTree(ctx, h, p)
+	err = operationError(ctx, name, "download", err)
+	s.finish("download", name, started, err)
+	return entries, err
+}
+
+// WriteTree validates and uploads a bounded tree rooted at a remote directory.
+func (s *Service) WriteTree(ctx context.Context, name, p string, entries []transport.TreeEntry) error {
+	started := time.Now()
+	h, err := s.authorize(name, "write")
+	if err != nil {
+		return err
+	}
+	if err := transport.ValidateTree(p, entries); err != nil {
+		return s.fail("upload", name, started, err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, transport.DefaultFileTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return s.fail("upload", name, started, operationError(ctx, name, "upload", err))
+	}
+	if err := s.enforceRoots(ctx, h, name, "upload", p, true); err != nil {
+		return s.fail("upload", name, started, err)
+	}
+	err = operationError(ctx, name, "upload", s.transport.WriteTree(ctx, h, p, entries))
+	s.finish("upload", name, started, err)
+	return err
 }
 
 // Text rejects binary data rather than silently replacing invalid UTF-8 in JSON.
