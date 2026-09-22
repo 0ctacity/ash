@@ -18,7 +18,7 @@ const Usage = `Usage:
   ash [--config PATH] hosts
   ash [--config PATH] host add NAME --address ADDRESS --user USER [--port N] [--identity PATH] [--exec] [--read] [--write]
   ash [--config PATH] doctor [HOST] [--json]
-  ash [--config PATH] exec HOST [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
+  ash [--config PATH] exec HOST [--stdin] [--cwd PATH] [--env KEY=VALUE] [--timeout 30s] -- COMMAND...
   ash [--config PATH] read HOST PATH
   ash [--config PATH] write HOST PATH < FILE
   ash [--config PATH] stat HOST PATH
@@ -31,6 +31,7 @@ const Usage = `Usage:
 
 COMMAND is shell code executed through the remote user's shell.
 Quote remote ~/ paths to prevent your local shell from expanding them.
+With --stdin, ASH forwards up to 64 KiB from standard input to the command.
 Shell send reads stdin if INPUT is omitted. Include a newline to execute input.
 Shell read returns a terminal snapshot, not an incremental log.
 `
@@ -59,6 +60,13 @@ func Run(ctx context.Context, args []string, s *service.Service, shells *service
 		req, err := parseExec(args[1:])
 		if err != nil {
 			return fail(err)
+		}
+		if req.StdinSet {
+			data, err := readInput(ctx, in, transport.MaxExecInputSize)
+			if err != nil {
+				return fail(err)
+			}
+			req.Stdin = data
 		}
 		r, err := s.Exec(ctx, req)
 		if err != nil {
@@ -131,6 +139,10 @@ func parseExec(args []string) (transport.ExecRequest, error) {
 			}
 			req.Command = strings.Join(args[i+1:], " ")
 			return req, nil
+		}
+		if args[i] == "--stdin" {
+			req.StdinSet = true
+			continue
 		}
 		key, value, hasValue := strings.Cut(args[i], "=")
 		if key != "--cwd" && key != "--env" && key != "--timeout" {

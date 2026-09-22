@@ -74,6 +74,7 @@ Use `ssh -p PORT USER@ADDRESS` for a custom port. ASH does not interpret OpenSSH
 ./ash doctor fedora --json
 ./ash exec fedora -- uname -a
 ./ash exec fedora --cwd '~/projects/zova' --env CI=true --timeout 30s -- go test ./...
+printf '{"ok":true}' | ./ash exec fedora --stdin -- elephant receive
 ./ash read fedora /etc/os-release
 printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 ./ash stat fedora /tmp/ash-test.txt
@@ -92,6 +93,8 @@ printf 'hello from ASH\n' | ./ash write fedora /tmp/ash-test.txt
 `doctor` validates configuration and SSH trust without connecting when no host is named. For a host it reports configuration, host resolution, policy, known-hosts, host-key trust, authentication, POSIX shell availability, remote cache permissions, and Zellij availability as separate checks, each with an actionable hint, and exits non-zero when a check fails. It never prints identity paths, key material, or environment secrets. Pass `--json` for stable structured output.
 
 Command stdout and stderr stay separate, and the CLI returns the remote process exit code. ASH failures print a diagnostic to stderr and return `1`. `hosts` and `stat` print JSON; `read` writes file bytes to stdout; `write` consumes stdin and creates or truncates the file. Parent directories must exist. Writes are not atomic and interruption may leave a partial file.
+
+Pass `--stdin` to forward standard input to the remote command, avoiding shell-quoting and command-size limits. Input is bounded at 64 KiB and fails clearly when exceeded. Without `--stdin`, ASH neither reads nor forwards standard input.
 
 Commands default to a five-minute timeout. File operations default to 30 seconds. Cancellation closes the SSH connection/session; it does not guarantee termination of detached remote descendants. Each operation opens and closes its own SSH connection.
 
@@ -142,7 +145,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | Tool | Inputs | Result |
 | --- | --- | --- |
 | `ash_hosts` | `{}` | Public host metadata and capabilities |
-| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
+| `ash_exec` | `host`, `command`; optional `cwd`, `env`, `timeout_ms`, `stdin`, `stdin_base64` | `exit_code`, `stdout`, `stderr`, truncation flags, `duration_ms` |
 | `ash_read` | `host`, `path` | UTF-8 `content` and byte `size` |
 | `ash_write` | `host`, `path`, `content` | Written byte `size` |
 | `ash_stat` | `host`, `path` | `path`, `size`, `mode`, `is_dir`, `modified_at` |
@@ -152,7 +155,7 @@ Client configuration formats vary. ASH serves only stdio; stdout is reserved for
 | `ash_shell_read` | `host`, `shell_id` | `content`, `truncated` |
 | `ash_shell_close` | `host`, `shell_id` | `closed` |
 
-A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.
+`ash_exec` accepts standard input as UTF-8 `stdin` or base64 `stdin_base64` (mutually exclusive, at most 64 KiB); set either to an empty value to send empty input. A non-zero remote process exit is a successful MCP tool result. Connection, authentication, trust, policy and timeout failures are tool errors. MCP reads reject invalid UTF-8; binary MCP file semantics are not supported. Host listings omit identity paths and authentication internals.
 
 Capabilities grant access with the remote account's permissions. They do not constrain paths or commands: an enabled `exec` capability can itself read or modify files. Configure only hosts and accounts you intend the connected agent to operate.
 
