@@ -12,6 +12,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -32,6 +33,55 @@ type Transport struct {
 func New(knownHostsPath string) (*Transport, error) {
 	return &Transport{knownHostsPath: knownHostsPath}, nil
 }
+
+// expandHome resolves a leading ~/ against the local home directory.
+func expandHome(path string) (string, error) {
+	if path == "~" || strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if path == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, path[2:]), nil
+	}
+	return path, nil
+}
+
+// errIdentityMissing reports an identity file that does not exist and is
+// allowed to be skipped.
+var errIdentityMissing = errors.New("identity file does not exist")
+
+// selectIdentities returns the identity paths to load and whether they are
+// explicitly configured in ASH. Identities resolved from `ssh -G` include
+// OpenSSH's default candidate paths regardless of existence, so a missing one
+// must be skipped the way OpenSSH skips it; an explicit ASH identity is a
+// deliberate instruction and stays strict.
+func selectIdentities(h host.Host) (paths []string, explicit bool) {
+	if len(h.Identities) == 0 && h.Identity != "" {
+		return []string{h.Identity}, true
+	}
+	return h.Identities, false
+}
+
+// loadIdentityFile reads and parses one identity file. When missingOK is set,
+// a file that does not exist yields errIdentityMissing instead of an error.
+func loadIdentityFile(path string, missingOK bool) (gossh.Signer, error) {
+	key, err := os.ReadFile(path)
+	if err != nil {
+		if missingOK && errors.Is(err, fs.ErrNotExist) {
+			return nil, errIdentityMissing
+		}
+		return nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
+	}
+	signer, err := gossh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("%w: parse identity: %v", transport.ErrAuthentication, err)
+	}
+	return signer, nil
+}
+
 func (t *Transport) knownHosts() (gossh.HostKeyCallback, error) {
 	callback, err := knownhosts.New(t.knownHostsPath)
 	if err != nil {
@@ -75,8 +125,14 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 		}
 	}
 	var allSigners []gossh.Signer
-	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
+	// An explicit OpenSSH IdentityAgent (including "none") overrides the
+	// environment; otherwise use SSH_AUTH_SOCK.
+	agentSocket := h.AgentSocket
+	if agentSocket == "" {
+		agentSocket = os.Getenv("SSH_AUTH_SOCK")
+	}
+	if agentSocket != "" && agentSocket != "none" {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "unix", agentSocket)
 		if err == nil {
 			agentConn = conn
 			stopAgent = context.AfterFunc(ctx, func() { conn.Close() })
@@ -86,25 +142,20 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 			}
 		}
 	}
-	if h.Identity != "" {
-		identity := h.Identity
-		if strings.HasPrefix(identity, "~/") {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				cleanupAgent()
-				return nil, nil, err
+	identities, strict := selectIdentities(h)
+	for _, identity := range identities {
+		path, err := expandHome(identity)
+		if err != nil {
+			cleanupAgent()
+			return nil, nil, err
+		}
+		signer, err := loadIdentityFile(path, !strict)
+		if err != nil {
+			if errors.Is(err, errIdentityMissing) {
+				continue
 			}
-			identity = filepath.Join(home, identity[2:])
-		}
-		key, err := os.ReadFile(identity)
-		if err != nil {
 			cleanupAgent()
-			return nil, nil, fmt.Errorf("%w: read identity: %v", transport.ErrAuthentication, err)
-		}
-		signer, err := gossh.ParsePrivateKey(key)
-		if err != nil {
-			cleanupAgent()
-			return nil, nil, fmt.Errorf("%w: parse identity: %v", transport.ErrAuthentication, err)
+			return nil, nil, err
 		}
 		allSigners = append(allSigners, signer)
 	}
@@ -120,16 +171,21 @@ func (t *Transport) connect(ctx context.Context, h host.Host) (*gossh.Client, fu
 	if port == 0 {
 		port = 22
 	}
-	address := net.JoinHostPort(h.Address, strconv.Itoa(port))
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", address)
+	dialAddress := net.JoinHostPort(h.Address, strconv.Itoa(port))
+	// HostKeyAlias changes only host-key lookup, not the dialed address.
+	verifyAddress := dialAddress
+	if h.HostKeyAlias != "" {
+		verifyAddress = net.JoinHostPort(h.HostKeyAlias, strconv.Itoa(port))
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", dialAddress)
 	if err != nil {
 		cleanupAgent()
 		return nil, nil, operationError(ctx, fmt.Errorf("connect to host %q: %w", h.Name, err))
 	}
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	cleanup := func() { stop(); conn.Close(); cleanupAgent() }
-	algorithms := preferredHostKeyAlgorithms(hostKey, address, conn.RemoteAddr())
-	sshConn, chans, reqs, err := gossh.NewClientConn(conn, address, &gossh.ClientConfig{User: h.User, Auth: []gossh.AuthMethod{gossh.PublicKeys(allSigners...)}, HostKeyCallback: hostKey, HostKeyAlgorithms: algorithms})
+	algorithms := preferredHostKeyAlgorithms(hostKey, verifyAddress, conn.RemoteAddr())
+	sshConn, chans, reqs, err := gossh.NewClientConn(conn, verifyAddress, &gossh.ClientConfig{User: h.User, Auth: []gossh.AuthMethod{gossh.PublicKeys(allSigners...)}, HostKeyCallback: hostKey, HostKeyAlgorithms: algorithms})
 	if err != nil {
 		cleanup()
 		err = operationError(ctx, err)
